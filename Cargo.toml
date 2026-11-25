@@ -2,7 +2,7 @@
 name = "blake3-servil-core"
 # BLAKE3-Servil's own version series, from 0.1.0, based on upstream BLAKE3 1.8.7:
 # tools/gen-ver.py sets X.Y.Z+<commit> here and tags vX.Y.Z+<commit>.
-version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+version = "0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc"
 authors = ["Jack O'Connor <oconnor663@gmail.com>", "Samuel Neves", "John Servil"]
 description = "the BLAKE3 hash function, on one thread: proved SME2 and integer + NEON kernels for AArch64, and x86-64 kernels"
 repository = "https://github.com/servil-software-factory/BLAKE3"
@@ -23,28 +23,15 @@ default = ["std"]
 # for OutputReader, and the Hasher::update_reader method. This feature is
 # enabled by default. (Previously this also controlled runtime CPU feature
 # detection on x86, which now reads CPUID directly, with or without std.)
-# Also enables the `std` feature of the `constant_time_eq` dependency, which
-# toggles a runtime feature check on 64-bit ARM targets.
-std = ["constant_time_eq/std"]
-
-[package.metadata.docs.rs]
-# Document the Serialize/Deserialize impls on docs.rs.
-features = ["serde"]
+std = []
 
 [dependencies]
 # BUILD_VERSION, in a crate of its own: its build script reruns on every
 # edit, and the library's, which assembles the kernels, does not.
-blake3-servil-version = { version = "=0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d", path = "version" }
-arrayvec = { version = "0.7.4", default-features = false }
-constant_time_eq = { version = "0.4.2", default-features = false }
-cfg-if = "1.0.0"
-serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+blake3-servil-version = { version = "=0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc", path = "version" }
 
-[target.'cfg(all(target_arch = "aarch64", any(target_vendor = "apple", target_os = "linux")))'.dependencies]
-libc = { version = "0.2", default-features = false }
-
-# The guard-page tests (src/test.rs) on x86-64 too.
-[target.'cfg(all(target_arch = "x86_64", any(target_vendor = "apple", target_os = "linux")))'.dev-dependencies]
+# The guard-page and self-test pipe tests on Linux and macOS.
+[target.'cfg(any(target_vendor = "apple", target_os = "linux"))'.dev-dependencies]
 libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
@@ -52,15 +39,6 @@ libc = { version = "0.2", default-features = false }
 # fixed expected values (BLAKE3_GOLDEN=1, src/test.rs's `golden`), and the
 # co-linking test checks its native symbols never replace ours.
 blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
-rand = "0.10.0"
-hmac = "0.13.0"
-hex = "0.4.2"
-tempfile = "3.8.0"
-serde_json = "1.0.107"
-ciborium = "0.2.2"
-
-[build-dependencies]
-cc = "1.1.12"
 
 # Tests built as users' release build is (opt-level 3, 16 codegen units,
 # no incremental compilation, no debug info), with its checks on: debug
@@ -82,6 +60,19 @@ overflow-checks = true
 [profile.mutants]
 inherits = "release"
 incremental = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+style = { level = "allow", priority = -1 }
+perf = { level = "allow", priority = -1 }
+cast_possible_truncation = "deny"
 
 # The fairness probes (#213) use the pool, which needs std: the no_std
 # build (--no-default-features) leaves them out.

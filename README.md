@@ -1,6 +1,13 @@
 # blake3-servil
 
-A fast [BLAKE3](https://blake3.io) implementation for 64-bit Arm and x86-64.
+A fast [BLAKE3](https://blake3.io) implementation for 64-bit Arm and x86-64, from the
+[Servil Software Factory](https://github.com/servil-software-factory).
+
+**Before 1.0.** The Servil Software Factory aims at software that serves its users reliably
+and loyally; [its page](https://github.com/servil-software-factory) says how, and what it
+promises for a project it supports. It counts a project as supported from version 1.0.
+blake3-servil is at 0.11, its first candidate: [SECURITY.md](SECURITY.md) says what we do
+about a vulnerability today, and the API may still change between minor versions.
 
 ## How fast
 
@@ -17,7 +24,8 @@ We measure and tune on one memory node. On Linux, the library keeps its
 workers on one node, within the CPUs the initializing thread is allowed:
 that thread's node or, where another node holds at least twice as many
 of those CPUs, the node that holds the most. `b3sum` keeps its calling thread and workers
-within the same node. The
+within the same node when a run uses multiple threads (deferred until
+default thread-count discovery is needed, eager for `--num-threads` > 1). The
 application still controls its own threads and buffer placement. This is
 for speed, and no hash depends on it. On a machine with several memory
 nodes it needs the node topology under `/sys/devices/system` to be
@@ -25,8 +33,9 @@ readable and `sched_setaffinity` to be allowed: where a sandbox hides the
 one, no node is chosen, and where it refuses the other for a thread, that
 thread runs on the CPUs it has. (A pool of one thread asked for by
 number, `initialize_multithreaded(NonZeroUsize::new(1))`, has no workers,
-so it reads no topology and binds nothing; `b3sum` tries to bind its own
-thread at any thread count.)
+so it reads no topology and binds nothing; `b3sum` likewise skips
+topology discovery and binding for `--num-threads 1` and single-threaded
+paths that never ask for workers, such as hashing one small regular file.)
 
 ## How it is checked
 
@@ -43,7 +52,8 @@ Its checks go further than most:
   BLAKE3, and each process checks its kernels before its first hash.
 - Memory use is checked with guard pages that catch a kernel reading one byte too far.
 
-Details: [`QUALITY.md`](QUALITY.md).
+Details: [`QUALITY.md`](QUALITY.md). The practices every Servil Software Factory project is
+to share: [the Factory's page](https://github.com/servil-software-factory).
 
 ## Using it
 
@@ -60,7 +70,7 @@ version names the commit of its code, so the version alone identifies
 what you have (`b3sum --version` and the C library's `b3_version()`
 print it). The code after a release reads `X.Y.Z+dev`, "newer than
 X.Y.Z", and a build of it prints its commit too, and from a dirty tree the
-Git tree id of its working tree: `0.10.0+dev.<commit>.dirty.<tree>`. Write
+Git tree id of its working tree: `0.11.0+dev.<commit>.dirty.<tree>`. Write
 it whole wherever you write it: tools that check it may come.
 
 ```rust
@@ -68,13 +78,13 @@ blake3_servil::initialize(); // once, before any other call
 let hash = blake3_servil::convenience::hash(b"foobarbaz");
 ```
 
-`blake3-servil-core` provides everything except multithreading, running on the calling thread with zero background threads. `blake3-servil` re-exports `blake3-servil-core` and adds multithreading: a multithreaded form of each call, and the `Pipeline`, which hashes a stream of messages as they arrive.
+`blake3-servil-core` provides everything except multithreading, running on the calling thread with zero background threads and zero third-party runtime or build dependencies (no C compiler needed), including fixed-length `Packed<16/32/48>` batch hashing and register-only `hash_counter_range` across all four SIMD backends. `blake3-servil` re-exports `blake3-servil-core` and adds multithreading: a multithreaded form of each call, and the `Pipeline`, which hashes a stream of messages as they arrive (with streaming `room`/`commit`, zero-copy caller-owned buffers via `Pipeline::with_owners` + `Pipeline::owned`, fixed-length `Batch`es and `Packed<16/32/48>` batches via `Pipeline::with_batches`, and per-message `Mode` via `Pipeline::message_with`).
 
 The [crate documentation](https://servil-software-factory.github.io/BLAKE3/blake3_servil/) covers the
 calls for programs that hash a lot, and the C library in [`capi/`](capi/).
 [`b3sum/README.md`](b3sum/README.md) covers the command-line tool.
 
-It runs on 64-bit Arm (Linux, macOS) and x86-64 (Linux, a CPU with SSE4.1: Intel since
+It runs on 64-bit Arm (Linux, macOS) and x86-64 (Linux, a CPU with SSSE3 and SSE4.1: Intel since
 2008, AMD since 2011) with the latest stable Rust; [official BLAKE3](https://github.com/BLAKE3-team/BLAKE3)
 serves other platforms.
 

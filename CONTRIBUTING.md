@@ -1,5 +1,17 @@
 # Working on BLAKE3 servil
 
+## Servil Software Factory: values, goals, and principles
+
+**We aspire to create software that serves its users reliably and loyally.** That is easy to say and hard to do. [The Servil Software Factory's page](https://github.com/servil-software-factory) says how we do it: the practices its projects share, which projects it supports (from version 1.0; this one is the first candidate), and what a project needs before it is supported. Five principles govern every change here:
+
+1. **Loyalty to the user:** minimize what the user has to trust — small owned code over sprawling dependency trees, hash-verified build inputs, and byte-for-byte reproducible releases.
+2. **Reliability by construction:** make invalid states unrepresentable, keep critical invariant checks active in release builds, fail closed, prove critical kernels, and test the tests with mutation testing and planted faults.
+3. **Radical honesty:** document what every check covers *and* what remains outside it (`QUALITY.md`), disclose AI authorship and lack of independent human audits plainly, never hide a slowdown, and publish frank after-action reports when serious bugs slip through.
+4. **Evidence over claims:** a commit lands only with every gate recorded on that exact commit (`tools/land.py`); speed is measured on quiet native machines kept for timing, and a virtual machine's timing never decides a landing or a release; an AI auditor counts toward a release once its recall has been measured on a tree of ours with known defects.
+5. **Clear boundaries:** support only the platforms we build and test natively, stop the build on any other with a message that names an alternative, and call a project supported from version 1.0.
+
+---
+
 BLAKE3-Servil, a fork of BLAKE3 1.8.7, aims at the fastest BLAKE3 in
 every situation a program meets: alone, beside other work, beside other
 hashing threads, natively and in virtual machines. It is two crates:
@@ -38,8 +50,9 @@ The README lists what BLAKE3-Servil adds for callers; the code is laid out so:
 - `threads/`: `blake3-servil`, the crate most programs use. It
   re-exports the core whole and adds the pool and a multithreaded form
   of each call: `lanes.rs` (the pool), `park.rs` and `finish.rs` (its
-  handshakes), `lib.rs` (the calls). It reaches the core's inside
-  through `hazmat`, a hidden module of the core that changes with the
+  handshakes), `lib.rs` (the calls). It hashes through the core's checked
+  calls, and takes its scheduling and storage setup from
+  `thread_support`, a hidden module of the core that changes with the
   two crates. `stream.rs` is the engine the Pipeline is to be built on
   (BLAKE3 #356), compiled for this crate's tests alone until then.
 - `version/`: `blake3-servil-version`, the build's version string, in a
@@ -57,16 +70,14 @@ header, the tool's README.
 
 ## Build and test
 
-The supported C compilers are those of supported operating systems: GCC
-12 or later (Debian 12's, the oldest; CI builds and tests with it) and
-Clang as current releases ship it; official BLAKE3 serves older ones.
-
-On AArch64 Linux and macOS the build includes the SME2 kernel when the C
-compiler assembles SME2: Clang 17 or later (Xcode 15 or later), or GCC 14
-or later with binutils 2.41. With an older compiler it builds without the
-kernel and warns (`CC=clang-19 cargo build` adds it on Debian 12, for
-example). On a
-CPU with SME2, the check stops when the build lacks the kernel.
+The Rust library crates (`blake3-servil-core` and `blake3-servil`) assemble all
+x86-64 and AArch64 (including NEON SHA-3 and SME2) kernels directly via
+`rustc`'s `core::arch::global_asm!`, with zero third-party runtime or build
+dependencies and no external C compiler required to assemble the libraries
+(a platform linker is still needed for executables, and C/dev tooling such as
+`capi/`, official `blake3` test oracles, and `tools/verify/` use a C compiler).
+On AArch64 Linux and macOS every build includes both NEON and SME2 kernels and
+selects SME2 at runtime on CPUs with 512-bit SME2.
 
 The tests run under [cargo-nextest](https://nexte.st), each in its own
 process (`cargo test` stops at once and says so); the doc examples run
@@ -246,6 +257,22 @@ margin.
 
 ## Branches and changes
 
+Before opening a pull request or kicking the landing gates, run through
+three quick authoring checks (and include the answer in the commit
+message or pull request body where relevant):
+
+1. **One truth and fewest modes:** Does this change keep two copies of
+   one idea (two lockfiles, two readers, two formats) or add a mode that
+   could be eliminated instead? Is anything now vestigial so it should
+   be deleted in this same commit?
+2. **Control proof (for non-Rust tools, CI steps, or new planted-fault
+   controls where `cargo-mutants` does not run):** Temporarily disable
+   the safeguard or plant the fault your new check guards against, run
+   it, and record the observed failure.
+3. **Non-default modes:** Exercise any `no_std`, optional-feature, or
+   stamped-release branch your change touches rather than relying only
+   on default/`+dev` runs.
+
 `next` is the development line and `main` the release line. Work happens
 on `candidate/<topic>` branches; a candidate joins `next` as a
 fast-forward of its tip (so what was checked is what lands), by
@@ -258,19 +285,35 @@ found complete. A candidate lands once:
 - every suite above passes, and `sh tools/check-builds.sh`;
 - CI passes on it, started by hand (`workflow_dispatch`) when it changes
   code for targets the VM and Mac do not run (x86-64, AArch64 without
-  SME2);
-- mutation testing passes on a change to the Rust
-  (`python3 tools/mutants/check.py`: the mutants in the changed lines,
-  in about a minute, the time it took printed at its end);
+  SME2). Shared GitHub Actions runners run `blake3-servil` under
+  `[profile.ci]` (`.config/nextest.toml`), which skips the 2-second
+  wall-clock `two_callers_share_the_pool` ratio test that flaked under
+  multi-tenant vCPU scheduling while keeping clockless fairness tests
+  (`lanes::sources::test`) on every CI job and `pool_fairness` on our
+  dedicated fleet hosts;
+- mutation testing passes on fast native hosts for a change to the Rust
+  (`python3 tools/mutants/check.py` on x86-64 Linux [~1.5 min] and Apple
+  Silicon arm64+SME2 [~1.7 min]; `tools/mutants/cargo-nextest` runs fast
+  `--lib` unit tests before `--tests` integration tests so mutants killed
+  by unit tests fail in milliseconds instead of hanging behind blocking
+  integration tests). Slow VM mutation runs (`arm-vm` `mutants aarch64`,
+  which averaged 22.4 min/run and cost 7.1 hours across 19 Nov 23 runs
+  with 8 timeout failures and 0 unique defects) are no longer a
+  per-landing gate and remain available on demand for pre-release runs,
+  while `arm-vm`'s Linux/AArch64 test suites (`tests aarch64`) stay a
+  mandatory landing gate;
 - its commit message says what it adds to the library or removes, with
   `python3 tools/size.py BASE REV`'s output where it changes the
   library's code (a few minutes: it counts and builds);
-- the regression check finds no slowdown natively on the timing Mac (a
-  Mac Mini M6 that runs timing jobs alone), over every cell
-  (`--cells all`:
-  about twenty minutes there). A candidate that changes no compiled code
-  needs no speed check: it would compare identical code. The Mac
-  check is a job you queue yourself, through the shared exchange
+- when benchmarked library code changes (`src/`, `c/`, `build.rs`,
+  `Cargo.toml`, `Cargo.lock`, `threads/src/`, `threads/build.rs`,
+  `threads/Cargo.toml`, `threads/Cargo.lock`, `version/`), the regression
+  check (`cells`) finds no slowdown natively on the timing Mac (a Mac
+  Mini M6 that runs timing jobs alone), over every cell (`--cells all`:
+  about twenty minutes there, queued in parallel with CI and tests).
+  Changes outside benchmarked library code (`b3sum/`, `capi/`, tests,
+  tools, CI, docs) do not require `cells` in `tools/land.py`. The Mac
+  check is a job queued through the shared exchange
   (`tools/runner/README.md`, "Running a job"), and
   its result is a link on the pull request. Every cell, since a change
   checked at the points its author expected can slow one nobody named;
@@ -279,9 +322,29 @@ found complete. A candidate lands once:
   commit message. Virtual machines are timed nightly on a best-effort
   basis (never awaited for a landing or a release, and a slowdown seen
   only on a VM is looked into when nothing better waits); the VM's
-  correctness checks, tests and mutants on AArch64 Linux, stay a gate.
-  Whoever made the candidate lands it once every check has passed,
-the same day: no review gate stands between a passing candidate and
+  correctness test suites on AArch64 Linux (`tests aarch64`) stay a gate.
+- for a change to shipped code (the library crates, `b3sum`, the C
+  header and API, and their build scripts and manifests), one review by
+  an AI model of another family than its author's has read it, with
+  `tools/review/BRIEF.md` as its brief (an author on a Claude model
+  takes a GPT or a Gemini reviewer, and so on; where the author's model
+  is not known, any model the author did not use). The reviewer works
+  alone, builds and runs what it needs, and plants faults to see whether
+  the change's tests catch them. Its report is public (a gist, or the
+  pull request). **One round**, and a finding holds the landing **only**
+  if it shows a wrong result, a crash or panic, a hang, or a slowdown.
+  Everything else (comments, style, minor edge cases, extra tests) lands
+  and becomes an issue. `python3 tools/land.py record review COMMIT
+  success "REVIEWER: what it found; what was done; where the report
+  is"` posts it. Tools, the job runner, mutation lists, workflows,
+  integration-only tests, and docs do not need a landing review.
+  (Zooko's Rule 2 trial, November 22, 2026: one ten-minute review of
+  shipped code found the running-digest slowdown of BLAKE3 #472, while
+  multi-round reviews of tools and mutation lists slowed down landings.
+  Re-evaluated after a few landings for quality against calendar time.)
+
+Whoever made the candidate lands it once every check has passed, the
+same day: no person's review stands between a passing candidate and
 `next`.
 
 Every open issue and pull request has one assignee, the person whose
@@ -336,8 +399,11 @@ it takes and ticks each step:
    `sh tools/check-builds.sh`. Pull-request CI normally checks a synthetic
    merge, so its head-SHA label alone is not evidence for the release commit.
 3. `bench-hashes check --against <previous release tag> --cells all`,
-   on the timing Mac (a Mac Mini M6, checked mechanically by
-   `tools/release-check.py`) and on the native x86 machines of the
+   on the timing Mac (a Mac Mini M6, `mac-m6-timing` in the runners'
+   exchange; `tools/release-check.py` reads that Mac's checks of the two
+   commits: the one it started last decides, every one of them must be a
+   whole record however old, and the job names both commits in full)
+   and on the native x86 machines of the
    fleet; VM timing runs nightly on a best-effort basis and is not
    awaited for a release. Use one bench commit on both sides for the
    calls they share. Compare new calls with a suitable development
@@ -367,14 +433,20 @@ it takes and ticks each step:
    move `main` to it, then publish its tag and artifacts (a release's
    commit is in `main`'s history, and the published check asks it):
    - the crates: publish all four from the same staged checkout and lock
-     used for the dry-run, with `--frozen` and the same explicit `-p` names.
-     Cargo publishes each dependency first: `blake3-servil-version`
-     (`version/`), `blake3-servil-core` (the repository root), `blake3-servil`
+     used for the dry-run, one at a time, each dependency first, stopping
+     at the first that fails: `blake3-servil-version` (`version/`),
+     `blake3-servil-core` (the repository root), `blake3-servil`
      (`threads/`), then `b3sums` (`b3sum/`; crates.io's `b3sum` is official
-     BLAKE3's). The C package has `publish = false` and ships as libraries;
+     BLAKE3's). Each is `cargo publish --locked --no-verify` with the
+     dry-run's `--manifest-path` and `--target-dir` and the one `-p` name.
+     (`--frozen` cannot publish: it forbids the request to the registry,
+     as 0.10.0's first attempt found. The dry-run has built each package,
+     and `python3 tools/release_artifacts.py TAG --published` then holds
+     what crates.io serves to the commit.) The C package has
+     `publish = false` and ships as libraries;
    - b3sum's binaries, built on each machine by `sh tools/b3sum-release.sh`
      from a fresh clone of the version commit (statically linked on Linux,
-     the same bytes whoever builds them), each with its `.sha256`;
+     the same bytes whoever builds them), each with its `.sha256` and `.b3`;
    - no archive of the C library: its build is not reproducible, so a
      published one could not be checked against the source as the other
      artifacts are. Users build it (`capi/README.md`);
@@ -403,7 +475,8 @@ names the checksums of those exact dependency archives.
 Save its output to the commit-named release log and append
 `publish-dry-run: ok` only when the command succeeds; this is a dry-run,
 never permission to upload. The final publication runs from the directory
-the script names, with `cargo publish --frozen` and the same `-p` names.
+the script names, with `cargo publish --locked --no-verify` and the same
+`-p` names, one at a time (step 9).
 
 ### The release lock
 
@@ -419,7 +492,56 @@ libraries' test dependencies; `python3 tools/gen-ver.py --check` fails
 where the two differ. To change a dependency: change it in `b3sum/`
 (`cargo update -p NAME --precise VERSION`), commit, then
 `sh tools/crates-release.sh --relock`, read the lock's change, and commit
-it.
+it. The dependency policy's checks, below, then run on the new lock.
+
+### The dependency policy
+
+Both locked resolutions — all six repository crates in the workspace
+(`tools/release/workspace.toml` and `tools/release/Cargo.lock`, covering
+the four published crates plus `capi/` and `test_vectors/`) and the
+standalone CLI (`b3sum/Cargo.lock`) — pass three checks in CI
+(`dependency policy`), under every feature;
+`python3 tools/dependency_policy.py` runs the same checks here. Every
+Rust build and test in CI runs `--locked` against those two lockfiles
+(`tools/ci-locked.sh` for the libraries, C API and test vectors;
+`b3sum/Cargo.lock` for `b3sum`). That covers what a build compiles in,
+what a build runs (build scripts, procedural macros), and the locked
+test dependencies of both graphs.
+
+- **Ours or from crates.io.** A package that a manifest takes by path
+  must be one of the six repository crates, which
+  `tools/release/workspace.toml` names. The two tools below take any
+  such package for ours, so a library copied into the repository would
+  pass them unaudited.
+- **`cargo-deny`, against `deny.toml`.** No advisory in RustSec's
+  database, wherever the package is in the graph. No yanked version,
+  and a version whose yank status could not be read fails too.
+  crates.io as the one source. A licence of MIT, Apache-2.0 or
+  TGPPL-1.0 (BOSL-1.0 is welcome too; since SPDX has no identifier for
+  it, a crate under it needs both a `clarify` entry identifying its
+  licence text as `LicenseRef-BOSL-1.0` and an `allow` or `exceptions`
+  entry for `LicenseRef-BOSL-1.0`); the one exception (`unicode-ident`,
+  `Unicode-3.0`) is recorded there with its reason.
+- **`cargo-vet`, against `tools/release/supply-chain/`.** Every version
+  has an audit published by Mozilla, Google, the Bytecode Alliance,
+  Zcash, Embark or ISRG, or an exemption recorded in `config.toml`:
+  `safe-to-run` for a package that only tests use, `safe-to-deploy` for
+  any other. The exemptions are a list to shorten, one audit at a time.
+
+CI fetches both tools by their hashes, checks that `b3sum/Cargo.lock`
+and `tools/release/Cargo.lock` agree (`tools/gen-ver.py --check`), and
+runs ten planted-fault controls (`python3 tools/dependency_policy.py
+controls`) beside the checks.
+
+A commit that changes a dependency runs the checks. For a new version
+without a published audit, read what changed and record the audit
+(`python3 tools/dependency_policy.py vet diff NAME OLD NEW`, then `vet
+certify NAME OLD NEW`), or add an exemption (`vet add-exemption NAME
+VERSION`) and give the reason in the commit.
+
+What the checks leave out:
+
+- SUPERCOP's non-Cargo C packaging is outside the Rust lockfiles.
 
 ### Every artifact is a clean build of the version commit
 
@@ -462,7 +584,7 @@ with Docker or Podman:
 
 ```sh
 git checkout TAG
-docker run --rm -v "$PWD":/src -w /src ubuntu:26.04 sh tools/b3sum-release-container.sh
+docker run --rm -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
 python3 tools/release_artifacts.py TAG --published --rebuilt dist
 ```
 

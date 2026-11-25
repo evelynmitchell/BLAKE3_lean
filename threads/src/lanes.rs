@@ -300,6 +300,12 @@ fn tree_threads(len: usize, available: usize, degree: usize) -> usize {
 }
 
 fn spare_pool() -> Option<(&'static Pool, Caller<'static>)> {
+    // During thread-local teardown, if this thread's pool scratch or job source
+    // TLS key is already destroyed, decline the pool so callers fall back
+    // cleanly to their serial paths instead of panicking inside a destructor.
+    if SCRATCH.try_with(|_| ()).is_err() || !sources::job_source_available() {
+        return None;
+    }
     let pool = pool();
     let callers = pool.callers.fetch_add(1, Ordering::SeqCst) + 1;
     let caller = Caller(&pool.callers);
@@ -339,13 +345,19 @@ std::thread_local! {
 /// (`each::prepare_thread`). After this, its calls on inputs the scratch
 /// holds allocate nothing.
 pub(crate) fn prepare_thread() {
-    SCRATCH.with(|s| {
+    let _ = SCRATCH.try_with(|s| {
         let mut s = s.borrow_mut();
+        s.pieces.clear();
+        s.cvs.clear();
         s.pieces.reserve(PREPARED_PIECES);
         s.cvs.reserve(PREPARED_PIECES);
     });
-    sources::job_source();
+    let _ = sources::try_job_source();
     crate::prepare_collection_thread();
+    #[cfg(blake3_sme2)]
+    if matches!(Platform::detect(), Platform::SME2 { .. }) {
+        blake3_servil_core::thread_support::prepare_sme2_scratch();
+    }
 }
 
 /// `cut` fills this thread's scratch with a job's pieces; `job` runs with
@@ -433,9 +445,14 @@ pub(crate) fn hash_each(tree: &TreeHasher, items: &[(&[crate::throughput::Block]
     let Some((pool, _caller)) = spare_pool() else {
         return hash_each_small(tree, items, out);
     };
-    let plan = pool.plan(places::Kind::Each, items.iter().map(|i| i.1).sum());
+    let plan = pool.plan(places::Kind::Each, items.iter().fold(0usize, |acc, i| acc.saturating_add(i.1)));
     with_scratch(
-        |pieces| cut_items(pieces, items, plan.threads, |item| crate::throughput::Block::bytes(item.0)[..item.1].len()),
+        |pieces| {
+            cut_items(pieces, items, plan.threads, |item| {
+                let n = crate::throughput::Block::bytes(item.0)[..item.1].len();
+                if n >= MIN_SPLIT_LEN { 0 } else { n }
+            })
+        },
         |(), pieces, _| {
             let work = Work::Each { items, tree: tree.clone().on_this_core(), pieces, outputs: out.as_mut_ptr() };
             pool.run_job(work, pieces.len(), 0, plan.threads, plan.near());
@@ -460,20 +477,16 @@ pub(crate) fn hash_each_small(tree: &TreeHasher, items: &[(&[crate::throughput::
 /// Cut `items` into consecutive ranges for `threads` threads, in order:
 /// each range takes items until it holds [`next_piece_len`] of the bytes
 /// that remain (one item at least, however long), so ranges shrink toward
-/// the end as subtree pieces do. An item of MIN_SPLIT_LEN or more weighs
-/// nothing here: it is hashed after, over the pool.
-fn cut_items<I>(pieces: &mut Vec<Piece>, items: &[I], threads: usize, len: impl Fn(&I) -> usize) {
-    let weight = |item: &I| {
-        let n = len(item);
-        if n >= MIN_SPLIT_LEN { 0 } else { n }
-    };
-    let mut remaining: usize = items.iter().map(&weight).sum();
+/// the end as subtree pieces do. Callers pass 0 weight for items of
+/// MIN_SPLIT_LEN or more, which are hashed after over the pool.
+fn cut_items<I>(pieces: &mut Vec<Piece>, items: &[I], threads: usize, weight: impl Fn(&I) -> usize) {
+    let mut remaining: u128 = items.iter().map(|item| weight(item) as u128).sum();
     let mut start = 0;
     while start < items.len() {
-        let want = next_piece_len(remaining, threads);
-        let (mut end, mut bytes) = (start, 0);
+        let want = next_piece_len(remaining.min(usize::MAX as u128) as usize, threads) as u128;
+        let (mut end, mut bytes) = (start, 0u128);
         while end < items.len() && (bytes < want || end == start) {
-            bytes += weight(&items[end]);
+            bytes += weight(&items[end]) as u128;
             end += 1;
         }
         remaining -= bytes;
@@ -903,7 +916,7 @@ fn cut_messages_vec(count: usize, message_len: usize, threads: usize) -> Vec<Pie
 #[cfg(test)]
 fn cut_items_vec(items: &[&[u8]], threads: usize) -> Vec<Piece> {
     let mut pieces = Vec::new();
-    cut_items(&mut pieces, items, threads, |item| item.len());
+    cut_items(&mut pieces, items, threads, |item| if item.len() >= MIN_SPLIT_LEN { 0 } else { item.len() });
     pieces
 }
 
@@ -1048,12 +1061,14 @@ pub(crate) mod places {
     }
 
     /// A job's kind: one message's tree, a batch of equal messages, a
-    /// collection. A thread learns for each apart.
+    /// collection, or a split `Pipeline::batch` submission. A thread learns
+    /// for each apart.
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub(crate) enum Kind {
         Tree = 0,
         Messages = 1,
         Each = 2,
+        PipelineBatch = 3,
     }
 
     /// What a thread has learned about one kind of job in one size class:
@@ -1167,12 +1182,24 @@ pub(crate) mod places {
         }
 
         /// The job [`Learned::choose`] gave its reach took `nanos` for `len` bytes.
+        #[cfg(test)]
         pub(crate) fn record(&mut self, nanos: u64, len: usize) {
+            self.record_for(self.stands().0, nanos, len);
+        }
+
+        /// Record a completed job that ran with `reach` in `nanos` for `len`
+        /// bytes. Under pipelined submission (`Pipeline::batch`), completions
+        /// submitted under the previous reach can finish after a phase flip;
+        /// ignoring mismatched reaches keeps each reach's measured rate pure.
+        pub(crate) fn record_for(&mut self, reach: Reach, nanos: u64, len: usize) {
+            let (expected, first) = self.stands();
+            if reach != expected {
+                return;
+            }
             let rate = u32::try_from(nanos.saturating_mul(1024) / len.max(1) as u64).unwrap_or(u32::MAX);
             // The fastest since the first of the measured jobs. (What the
             // jobs before it add is forgotten at that job, before the
             // rates are next compared, at a round's end.)
-            let (reach, first) = self.stands();
             // A round's trial ends at a hopeless job: a measured one (not
             // the trial's first, which pays for the other reach's
             // leavings) more than HOPELESS times as slow as the round's
@@ -1201,10 +1228,10 @@ pub(crate) mod places {
         }
     }
 
-    /// The size classes a thread learns in: jobs of 2^19 to 2^27 bytes
-    /// and over, by their length's highest bit; shorter jobs with the
+    /// The size classes a thread learns in: jobs of 2^16 (64 KiB) to 2^27
+    /// bytes and over, by their length's highest bit; shorter jobs with the
     /// first, and jobs of FAR_LEN or more are every thread's unasked.
-    const CLASSES: usize = 9;
+    const CLASSES: usize = 12;
 
     /// A job of this many bytes or more is every thread's: 256 MiB, more
     /// than any cache holds, where the caller's place alone was never the
@@ -1212,11 +1239,11 @@ pub(crate) mod places {
     pub(crate) const FAR_LEN: usize = 1 << 28;
 
     fn class(len: usize) -> usize {
-        ((usize::BITS - 1 - len.max(1).leading_zeros()) as usize).clamp(19, 19 + CLASSES - 1) - 19
+        ((usize::BITS - 1 - len.max(1).leading_zeros()) as usize).clamp(16, 16 + CLASSES - 1) - 16
     }
 
     std::thread_local! {
-        static LEARNED: core::cell::Cell<[[Learned; CLASSES]; 3]> = const { core::cell::Cell::new([[Learned { job: 0, rate: [0; 2], round: None, longer: 0 }; CLASSES]; 3]) };
+        static LEARNED: core::cell::Cell<[[Learned; CLASSES]; 4]> = const { core::cell::Cell::new([[Learned { job: 0, rate: [0; 2], round: None, longer: 0 }; CLASSES]; 4]) };
         /// The thread's last learning job: its kind and class, and when it ended.
         static LAST: core::cell::Cell<Option<(Kind, usize, std::time::Instant)>> = const { core::cell::Cell::new(None) };
     }
@@ -1225,13 +1252,19 @@ pub(crate) mod places {
     /// time and `cycle` the time since the thread's last job of its kind
     /// and class ended, if that was the thread's last learning job. The
     /// cycle, where the jobs follow closely (it is under CLOSE times the
-    /// job's own time); else the job's own time: what the caller did in a
-    /// long gap says nothing of the reach.
-    fn cost(job: std::time::Duration, cycle: Option<std::time::Duration>) -> u64 {
+    /// job's own time) and is not a burst drain of already-completed
+    /// pipelined batches (`cycle * in_flight * 4 < job`); else the job's own
+    /// time.
+    fn cost(job: std::time::Duration, cycle: Option<std::time::Duration>, in_flight: usize) -> u64 {
         let nanos = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let job_ns = nanos(job);
         match cycle {
-            Some(cycle) if nanos(cycle) < CLOSE.saturating_mul(nanos(job)) => nanos(cycle),
-            _ => nanos(job),
+            Some(cycle) => {
+                let cycle_ns = nanos(cycle);
+                let burst_drain = in_flight > 1 && cycle_ns.saturating_mul(in_flight as u64).saturating_mul(4) < job_ns;
+                if !burst_drain && cycle_ns < CLOSE.saturating_mul(job_ns) { cycle_ns } else { job_ns }
+            }
+            None => job_ns,
         }
     }
 
@@ -1244,9 +1277,12 @@ pub(crate) mod places {
     const CLOSE: u64 = 64;
 
     /// A job's plan, and its clock where the thread is learning.
+    #[derive(Clone, Copy)]
     pub(crate) struct Plan {
         /// The threads the job is cut for and wakes, its caller among them.
         pub(crate) threads: usize,
+        /// Active batches in flight when this plan was created (`1` for sync calls).
+        pub(crate) in_flight: usize,
         learning: Option<(Kind, usize, Reach, std::time::Instant)>,
     }
 
@@ -1255,13 +1291,13 @@ pub(crate) mod places {
         /// threads: all of them, where the workers have no places, where
         /// the caller's place has none, and from FAR_LEN up.
         pub(crate) fn new(kind: Kind, len: usize, all: usize) -> Plan {
-            let Some(near) = near_workers() else { return Plan { threads: all, learning: None } };
+            let Some(near) = near_workers() else { return Plan { threads: all, in_flight: 1, learning: None } };
             if len >= FAR_LEN {
-                return Plan { threads: all, learning: None };
+                return Plan { threads: all, in_flight: 1, learning: None };
             }
             let reach = LEARNED.with(|l| l.get()[kind as usize][class(len)].choose());
             let threads = if reach == Reach::Near { (near + 1).min(all) } else { all };
-            Plan { threads, learning: Some((kind, len, reach, now())) }
+            Plan { threads, in_flight: 1, learning: Some((kind, len, reach, now())) }
         }
 
         /// Whether the job stays with the caller's place.
@@ -1271,17 +1307,18 @@ pub(crate) mod places {
 
         /// The job is done: the thread learns from it.
         pub(crate) fn done(&self) {
-            if let Some((kind, len, _, started)) = self.learning {
+            if let Some((kind, len, reach, started)) = self.learning {
                 let ended = now();
                 let nanos = cost(
                     ended - started,
                     LAST.with(|l| l.replace(Some((kind, class(len), ended))))
                         .filter(|&(k, c, _)| k == kind && c == class(len))
                         .map(|(_, _, last)| ended - last),
+                    self.in_flight.max(1),
                 );
                 LEARNED.with(|l| {
                     let mut all = l.get();
-                    all[kind as usize][class(len)].record(nanos, len);
+                    all[kind as usize][class(len)].record_for(reach, nanos, len);
                     l.set(all);
                 });
             }
@@ -1363,14 +1400,14 @@ pub(crate) mod places {
         let mut places = Places {
             of_cpu: std::vec![u16::MAX; CPUS].into(),
             cpus: std::vec![[0u64; CPUS / 64]; caches.len()].into(),
-            of_worker: (0..workers).map(|k| order[(k + 1) % order.len()].0 as u8).collect(),
+            of_worker: (0..workers).map(|k| u8::try_from(order[(k + 1) % order.len()].0).expect("place fits u8")).collect(),
             near: std::vec![std::vec![0u64; words].into_boxed_slice(); caches.len()].into(),
             beside: std::vec![std::vec![0u64; words].into_boxed_slice(); caches.len()].into(),
             count: std::vec![0usize; caches.len()].into(),
         };
         let mut socket_of = std::vec![0usize; caches.len()];
         for &(place, c) in &order {
-            places.of_cpu[c.cpu] = place as u16;
+            places.of_cpu[c.cpu] = u16::try_from(place).expect("place fits u16");
             places.cpus[place][c.cpu / 64] |= 1 << (c.cpu % 64);
             socket_of[place] = c.socket;
         }
@@ -1444,7 +1481,7 @@ pub(crate) mod places {
     /// Whether `set` holds `member`.
     #[cfg(target_os = "linux")]
     fn has(set: &Set, member: usize) -> bool {
-        set.get(member / 64).is_some_and(|word| word & 1u64.rotate_left(member as u32) != 0)
+        set.get(member / 64).is_some_and(|word| word & 1u64.rotate_left(u32::try_from(member).expect("member fits u32")) != 0)
     }
 
     /// A kernel CPU list, such as `0-3,8,10-11`, in the affinity layout:
@@ -1461,7 +1498,7 @@ pub(crate) mod places {
                 return None;
             }
             for cpu in first..=last {
-                set[cpu / 64] |= 1u64.rotate_left(cpu as u32);
+                set[cpu / 64] |= 1u64.rotate_left(u32::try_from(cpu).expect("cpu fits u32"));
             }
         }
         Some(set)
@@ -1562,7 +1599,7 @@ pub(crate) mod places {
                     said.push((node, [0; CPUS / 64]));
                     said.len() - 1
                 });
-                said[at].1[other / 64] |= 1u64.rotate_left(other as u32);
+                said[at].1[other / 64] |= 1u64.rotate_left(u32::try_from(other).expect("cpu fits u32"));
             }
             if !said.iter().any(|(node, cpus)| *node == here && *cpus == own.0) {
                 return None;
@@ -1772,6 +1809,41 @@ pub(crate) mod places {
             assert!(online_nodes(Ok("garbage\n".into())).is_none());
         }
 
+        #[cfg(target_os = "linux")]
+        struct TempDir(std::path::PathBuf);
+
+        #[cfg(target_os = "linux")]
+        impl TempDir {
+            fn new(tag: &str) -> Self {
+                use std::os::unix::fs::DirBuilderExt;
+                static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+                let base = std::env::temp_dir();
+                let base = if base.is_absolute() { base } else { std::env::current_dir().unwrap().join(base) };
+                let pid = std::process::id();
+                for _ in 0..1024 {
+                    let id = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let path = base.join(format!("blake3-servil-{tag}-{pid}-{id}"));
+                    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                        Ok(()) => return Self(path),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => panic!("TempDir::new failed for {}: {e}", path.display()),
+                    }
+                }
+                panic!("TempDir::new exhausted unique directory attempts for {tag}");
+            }
+
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         /// A node is found only where the system tells all of it, and all
         /// it tells agrees: more than one node online, one node for this
         /// CPU, that node online, and its CPUs, this one among them.
@@ -1783,7 +1855,7 @@ pub(crate) mod places {
         #[test]
         #[cfg(target_os = "linux")]
         fn a_node_is_found_only_where_the_system_tells_all_of_it() {
-            let root = tempfile::tempdir().unwrap();
+            let root = TempDir::new("node-find");
             // A machine of two nodes: CPUs 0-1 on node 0, CPUs 2-3 on node
             // 1, as `find` reads it for CPU 2; `change` then takes
             // something away.
@@ -1836,7 +1908,7 @@ pub(crate) mod places {
         #[test]
         #[cfg(target_os = "linux")]
         fn the_node_that_holds_the_most_allowed_cpus_is_kept_to() {
-            let root = tempfile::tempdir().unwrap();
+            let root = TempDir::new("node-largest");
             let case = |name: &str, cpu: usize, allowed: &str, change: &dyn Fn(&std::path::Path)| {
                 let system = root.path().join(name);
                 for cpu in 0..12 {
@@ -1993,10 +2065,39 @@ pub(crate) mod places {
 
         #[test]
         #[cfg(target_os = "linux")]
+        fn allowed_reads_single_nonzero_cpu_mask() {
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let list = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:")).unwrap();
+            let Some(&target) = listed(list).iter().find(|&&c| c % 64 != 0) else { return };
+            std::thread::spawn(move || {
+                let mut one: Set = [0; CPUS / 64];
+                one[target / 64] = 1u64 << (target % 64);
+                // Sound: `one` is `size_of::<Set>()` readable bytes on this stack.
+                if unsafe { sched_setaffinity(0, core::mem::size_of::<Set>(), &one) } == 0 {
+                    assert_eq!(allowed(), Some(vec![target]));
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(err.raw_os_error(), Some(libc::EPERM), "unexpected sched_setaffinity error: {err}");
+                }
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
         fn the_pool_stays_on_one_node_without_binding_the_caller() {
             let before = affinity().unwrap();
             let nodes = node_masks();
-            if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 || allowed_nodes(&nodes, &before) < 2 {
+            let max_node_cpus = nodes
+                .iter()
+                .map(|cpus| cpus.iter().zip(&before).map(|(node, allowed)| (node & allowed).count_ones() as usize).sum::<usize>())
+                .max()
+                .unwrap_or(0);
+            // Skip when no single allowed node has >= 2 CPUs (e.g., 1 CPU on
+            // each of two nodes sizes the default pool to 1 thread with 0
+            // workers, #465).
+            if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 || allowed_nodes(&nodes, &before) < 2 || max_node_cpus < 2 {
                 return;
             }
             crate::initialize_multithreaded(None);
@@ -2093,6 +2194,17 @@ pub(crate) mod places {
         #[test]
         #[cfg(target_os = "linux")]
         fn the_workers_take_their_places_and_a_thread_learns() {
+            let Ok(cur) = affinity() else {
+                return;
+            };
+            // Sound: `cur` is a live `Set` of `size_of::<Set>()` readable bytes.
+            if unsafe { sched_setaffinity(0, core::mem::size_of::<Set>(), &cur) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+                    return; // Sandbox refuses CPU binding (#465).
+                }
+                panic!("sched_setaffinity failed unexpectedly: {err}");
+            }
             confine_cli_thread();
             let cpus = allowed().unwrap();
             if cpus.len() < 4 {
@@ -2229,6 +2341,15 @@ pub(crate) mod places {
             plan.done();
             assert_eq!(LEARNED.with(|l| l.get()), before);
             assert!(Plan::new(Kind::Tree, FAR_LEN - 1, all).learning.is_some());
+            // Split Pipeline::batch learns its own kind (Kind::PipelineBatch).
+            for job in 0..2 * TRIAL {
+                let mut bp = Plan::new(Kind::PipelineBatch, len, all);
+                bp.in_flight = 2;
+                assert_eq!(bp.near(), job >= TRIAL, "PipelineBatch job {job}");
+                bp.done();
+            }
+            assert_eq!(learned(Kind::PipelineBatch, len).rate, [651, 651]);
+            assert!(!Plan::new(Kind::PipelineBatch, FAR_LEN, all).near());
             TEST_CLOCK.with(|c| c.set(None));
             // Real jobs, of both reaches: the digests are right, and a
             // near job asks for no more workers than its place has.
@@ -2465,12 +2586,12 @@ pub(crate) mod places {
         #[test]
         fn a_jobs_cost_is_its_cycle_where_jobs_follow_closely() {
             let us = std::time::Duration::from_micros;
-            assert_eq!(cost(us(100), None), 100_000);
-            assert_eq!(cost(us(100), Some(us(150))), 150_000);
-            assert_eq!(cost(us(100), Some(us(6399))), 6_399_000);
-            assert_eq!(cost(us(100), Some(us(6400))), 100_000, "CLOSE times the job: a gap");
-            assert_eq!(cost(us(100), Some(us(5_000_000))), 100_000);
-            assert_eq!(cost(us(0), Some(us(0))), 0);
+            assert_eq!(cost(us(100), None, 1), 100_000);
+            assert_eq!(cost(us(100), Some(us(150)), 1), 150_000);
+            assert_eq!(cost(us(100), Some(us(6399)), 1), 6_399_000);
+            assert_eq!(cost(us(100), Some(us(6400)), 1), 100_000, "CLOSE times the job: a gap");
+            assert_eq!(cost(us(100), Some(us(5_000_000)), 1), 100_000);
+            assert_eq!(cost(us(0), Some(us(0)), 1), 0);
         }
 
         /// On every system the pool settles (with places or without), and
@@ -2497,18 +2618,57 @@ pub(crate) mod places {
             for (len, want) in [
                 (0usize, 0),
                 (1, 0),
-                (1 << 19, 0),
-                ((1 << 20) - 1, 0),
-                (1 << 20, 1),
-                (3 << 20, 2),
-                (1 << 26, 7),
-                ((1 << 27) - 1, 7),
-                (1 << 27, 8),
-                (1 << 30, 8),
-                (usize::MAX, 8),
+                (1 << 16, 0),
+                ((1 << 17) - 1, 0),
+                (1 << 17, 1),
+                (1 << 18, 2),
+                (1 << 19, 3),
+                (1 << 20, 4),
+                (3 << 20, 5),
+                (1 << 26, 10),
+                ((1 << 27) - 1, 10),
+                (1 << 27, 11),
+                (1 << 30, 11),
+                (usize::MAX, 11),
             ] {
                 assert_eq!(class(len), want, "len={len}");
             }
+        }
+
+        #[test]
+        fn pipelined_learning_ignores_stale_reach_and_burst_drains() {
+            let mut l = Learned::default();
+            for _ in 0..TRIAL {
+                assert_eq!(l.choose(), Reach::All);
+                l.record_for(Reach::All, 200, 1024);
+            }
+            assert_eq!(l.choose(), Reach::Near);
+            // A stale in-flight All completion after flipping to Near must not
+            // advance or corrupt Near's measurement.
+            l.record_for(Reach::All, 5, 1024);
+            assert_eq!(l.choose(), Reach::Near);
+            for _ in 0..TRIAL {
+                l.record_for(Reach::Near, 100, 1024);
+            }
+            assert_eq!(l.choose(), Reach::Near, "Near won (100 < 200 ns/KiB)");
+
+            let mut reuse = Learned::default();
+            for _ in 0..TRIAL {
+                reuse.record_for(Reach::All, 50, 1024);
+            }
+            for _ in 0..TRIAL {
+                reuse.record_for(Reach::Near, 250, 1024);
+            }
+            assert_eq!(reuse.choose(), Reach::All, "All won (50 < 250 ns/KiB)");
+
+            let job = std::time::Duration::from_micros(800);
+            let burst = std::time::Duration::from_nanos(99_999);
+            let edge = std::time::Duration::from_micros(100); // 100 * 2 * 4 == 800
+            let steady = std::time::Duration::from_micros(400);
+            assert_eq!(cost(job, Some(burst), 2), 800_000, "burst drain falls back to job time");
+            assert_eq!(cost(job, Some(edge), 2), 100_000, "exact cycle*in_flight*4 == job is kept");
+            assert_eq!(cost(job, Some(steady), 2), 400_000, "steady pipelined cycle is kept");
+            assert_eq!(cost(job, Some(burst), 1), 99_999, "sequential in_flight=1 preserves cost");
         }
 
         /// Where the workers have no places (this machine's tests: none
@@ -2713,7 +2873,10 @@ impl Pool {
         // wait is over: nothing runs on the normal path).
         let ptr = &job as *const Job as *mut Job<'static>;
         let published = AbortOnUnwind;
-        let target = source.publish_job(ptr, pieces, own, near);
+        // Sound: `job` stays alive on this stack until `source.wait(target)`
+        // returns (guaranteed even on unwind by `end_on_unwind`), and `source`
+        // is this thread's exclusive one-shot job source.
+        let target = unsafe { source.publish_job(ptr, pieces, own, near) };
         if slot.is_some() {
             // A worker for each piece past the caller's first (none for a
             // job of one past its own: a wake for none is nothing); for a
@@ -2867,14 +3030,17 @@ pub(crate) mod sources {
     /// the SME2 turn (a subtree of 16 KiB or more) rather than on NEON.
     pub(crate) const ACTION_SME2: u64 = 1 << 63;
 
-    /// A pipeline's item in a source: three atomic words read before the
-    /// claimer's CAS (`take_claimed`) and rewritten only after `claimed`
-    /// has passed it (`publish_actions`), so no claimer copies non-atomic
-    /// memory after its claim (BLAKE3 #302).
+    /// A pipeline's item in a source: atomic fields read before the claimer's
+    /// CAS (`take`) and rewritten only after `claimed` has passed it
+    /// (`publish_actions`), so no claimer copies non-atomic memory after its
+    /// claim (BLAKE3 #302). Each slot carries its own `near` wake-preference
+    /// hint so mixed publications in one queue never overwrite earlier items'
+    /// wake policy.
     struct Action {
         run: AtomicPtr<()>,
         context: AtomicPtr<()>,
         arg: AtomicU64,
+        near: core::sync::atomic::AtomicBool,
     }
 
     #[repr(align(128))]
@@ -2896,16 +3062,12 @@ pub(crate) mod sources {
         finish: crate::finish::Finish,
     }
 
-    // Sound: a place is written by the source's one publisher, and only
-    // once the task published into it `len` publications ago has been
-    // copied out by its claimer: the publisher's contract (`publish`),
-    // checked in tests and debug builds. It is read by the one thread
-    // whose CAS claimed the publication in it, across the Release store
-    // of `published` and the Acquire load. An action's words are atomics,
-    // read before the claimer's AcqRel CAS and written again only after an
-    // Acquire load of `claimed` passes that slot.
-    // `owner` is behind its lock; the rest is atomics.
+    // Sound: every slot is written by one publisher after the previous claimer
+    // copied its fields out (across Release/Acquire on `published` / `claimed`);
+    // action words are atomics, `Finish::owner` is synchronized by its mutex,
+    // and the remaining fields are atomic.
     unsafe impl Sync for Source {}
+    // Sound: `Source` holds only atomics, `Finish` (mutex-synchronized), and self-synchronized raw action slots.
     unsafe impl Send for Source {}
 
     /// What a claim takes: a stream's task, a pipeline's action, or a run
@@ -2926,7 +3088,12 @@ pub(crate) mod sources {
             Source {
                 claimed: OwnLine(AtomicUsize::new(0)),
                 actions: (0..actions)
-                    .map(|_| Action { run: AtomicPtr::new(core::ptr::null_mut()), context: AtomicPtr::new(core::ptr::null_mut()), arg: AtomicU64::new(0) })
+                    .map(|_| Action {
+                        run: AtomicPtr::new(core::ptr::null_mut()),
+                        context: AtomicPtr::new(core::ptr::null_mut()),
+                        arg: AtomicU64::new(0),
+                        near: core::sync::atomic::AtomicBool::new(false),
+                    })
                     .collect(),
                 job: AtomicPtr::new(core::ptr::null_mut()),
                 base: AtomicUsize::new(0),
@@ -2959,9 +3126,16 @@ pub(crate) mod sources {
         /// Publish one or more pipeline actions in order with one Release
         /// store and one fence, then wake parked workers only where awake
         /// workers fall short of the items waiting.
-        pub(crate) fn publish_actions(&self, run: unsafe fn(*const (), u64, Platform), context: *const (), args: &[u64]) {
+        ///
+        /// # Safety
+        ///
+        /// This source must be an action source with a single publisher at a
+        /// time, and every `(run, context, arg)` tuple published must be safe
+        /// for a worker (or caller) to invoke once with the assigned `Platform`.
+        pub(crate) unsafe fn publish_actions(&self, run: unsafe fn(*const (), u64, Platform), context: *const (), args: &[u64], near: bool) {
             debug_assert!(!args.is_empty());
             let p = self.finish.published.load(Ordering::Relaxed);
+            let next = p.checked_add(args.len()).expect("Source action ticket counter exhausted");
             assert!(p - self.claimed.load(Ordering::Acquire) + args.len() <= self.actions.len(), "a source's actions hold every item not yet taken");
             let cap = self.actions.len();
             for (k, &arg) in args.iter().enumerate() {
@@ -2969,17 +3143,25 @@ pub(crate) mod sources {
                 slot.run.store(run as *mut (), Ordering::Relaxed);
                 slot.context.store(context as *mut (), Ordering::Relaxed);
                 slot.arg.store(arg, Ordering::Relaxed);
+                slot.near.store(near, Ordering::Relaxed);
             }
-            self.finish.published.store(p + args.len(), Ordering::Release);
+            self.finish.published.store(next, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
             let pool = pool();
             if pool.sme2 {
                 wake_sme2();
             }
             if self.waiting() >= 2 {
-                noted(Noted::WakeTry);
-                pool.park.wake_one();
+                wake_speculative(&pool.park, self.front_action_near());
             }
+        }
+
+        /// Whether the action currently at the head of this source's waiting
+        /// ring prefers local-cache speculative wakes.
+        pub(crate) fn front_action_near(&self) -> bool {
+            let c = self.claimed.load(Ordering::Acquire);
+            let p = self.finish.published.load(Ordering::Acquire);
+            c < p && self.actions[c % self.actions.len()].near.load(Ordering::Relaxed)
         }
 
         /// Run one unclaimed action from this source on the calling thread,
@@ -2987,6 +3169,7 @@ pub(crate) mod sources {
         pub(crate) fn run_waiting_action(&self) -> bool {
             match self.take() {
                 Some(Item::Action { run, context, arg }) => {
+                    // Sound: `publish_actions` stored an `unsafe fn(*const (), u64, Platform)` function pointer and live `context` valid until completion.
                     let f: unsafe fn(*const (), u64, Platform) = unsafe { core::mem::transmute(run) };
                     unsafe { f(context as *const (), arg & !ACTION_SME2, pool_platform()) };
                     true
@@ -2996,20 +3179,33 @@ pub(crate) mod sources {
             }
         }
 
+        #[cfg(test)]
+        pub(super) fn own_for_test(&self) {
+            self.finish.own();
+        }
+
         /// Make `job` the caller's current job, its pieces `0..own` the
         /// caller's own: the number `finished` must reach when it is done.
-        pub(crate) fn publish_job(&self, job: *mut Job<'static>, pieces: usize, own: usize, near: bool) -> usize {
+        ///
+        /// # Safety
+        ///
+        /// This source must be a single-publisher job source, `own <= pieces`,
+        /// and `job` (along with all buffers its pieces read/write) must stay
+        /// valid until `self.wait(target)` returns.
+        pub(crate) unsafe fn publish_job(&self, job: *mut Job<'static>, pieces: usize, own: usize, near: bool) -> usize {
             let base = self.finish.published.load(Ordering::Relaxed);
             debug_assert_eq!(self.finish.finished_count(), base, "the last job is finished");
+            let target = base.checked_add(pieces).expect("Source job counter overflow");
+            assert!(target < crate::finish::SLEEPING, "Source job counter reached Finish::SLEEPING limit");
             self.near.store(near, Ordering::Relaxed);
             self.job.store(job, Ordering::Relaxed);
             self.base.store(base, Ordering::Relaxed);
             // No worker can claim a number yet (claimed == published), so
             // this store alone moves `claimed` past the caller's own pieces.
             self.claimed.store(base + own, Ordering::Relaxed);
-            self.finish.published.store(base + pieces, Ordering::Release);
+            self.finish.published.store(target, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
-            base + pieces
+            target
         }
 
         /// Claim the next published item, if any.
@@ -3063,7 +3259,10 @@ pub(crate) mod sources {
         /// waiting, expecting the caller to take a lone one, and a caller
         /// that only collects never does (it waited forever, the workers
         /// asleep: the C API's stream test on an i7-12700K and on GitHub's
-        /// 4-CPU runners; Devon Jonte, #99).
+        /// 4-CPU runners; Devon Jonte, #99). Always calls `wake_one()` (which
+        /// tries the caller's place first and still wakes a remote parked
+        /// worker if local workers are busy) so sleeping external executors
+        /// always make progress.
         pub(crate) fn wake_for_waiting(&self) {
             let pool = pool();
             if self.waiting() > 0 {
@@ -3130,9 +3329,15 @@ pub(crate) mod sources {
         static MINE: std::cell::OnceCell<Held> = const { std::cell::OnceCell::new() };
     }
 
-    /// This thread's source for its one-shot jobs.
-    pub(crate) fn job_source() -> &'static Source {
-        MINE.with(|mine| {
+    /// Whether this thread's job-source TLS key is still live (false only
+    /// during thread-local destruction after `MINE` has been destroyed).
+    pub(crate) fn job_source_available() -> bool {
+        MINE.try_with(|_| ()).is_ok()
+    }
+
+    /// This thread's source for its one-shot jobs, or `None` during TLS teardown.
+    pub(crate) fn try_job_source() -> Option<&'static Source> {
+        MINE.try_with(|mine| {
             mine.get_or_init(|| {
                 let source = FREE_JOBS.lock().unwrap().pop().unwrap_or_else(|| Box::leak(Box::new(Source::new())));
                 source.finish.own();
@@ -3140,6 +3345,12 @@ pub(crate) mod sources {
             })
             .0
         })
+        .ok()
+    }
+
+    /// This thread's source for its one-shot jobs.
+    pub(crate) fn job_source() -> &'static Source {
+        try_job_source().expect("job_source called after TLS destruction")
     }
 
     pub(crate) fn opened() {
@@ -3162,7 +3373,7 @@ pub(crate) mod sources {
     /// The slot of the first registered source for which `f` says yes, in
     /// a walk of the slots from `start` up and then of those below it.
     fn find_from(start: usize, mut f: impl FnMut(&'static Source) -> bool) -> Option<usize> {
-        let mut active = ACTIVE.load(Ordering::SeqCst).rotate_right(start as u32);
+        let mut active = ACTIVE.load(Ordering::SeqCst).rotate_right(u32::from(start.to_le_bytes()[0]));
         while active != 0 {
             let slot = (active.trailing_zeros() as usize + start) % SLOTS;
             active &= active - 1;
@@ -3228,26 +3439,39 @@ pub(crate) mod sources {
         if in_turn {
             // The slot after this one (after the last, the first: the
             // walk takes its start round).
-            *turn = Turn { taken: 0, cursor: (slot + 1) as u32 };
+            *turn = Turn { taken: 0, cursor: u32::from((slot + 1).to_le_bytes()[0]) };
         } else {
             turn.taken += 1;
         }
         true
     }
 
+    /// Speculative publication / worker-chain wake: prefers the waker's own
+    /// place when `near` is set without spilling to remote caches; spills
+    /// across places when `near` is false. Progress waits (`wake_for_waiting`)
+    /// never call this and always call `Park::wake_one()`.
+    fn wake_speculative(park: &crate::park::Park, near: bool) {
+        noted(Noted::WakeTry);
+        if near {
+            park.wake_one_near();
+        } else {
+            park.wake_one();
+        }
+    }
+
     /// Hash `item` of `source` on this thread, waking the next worker first
     /// when two or more wait and one is parked.
     fn serve(source: &'static Source, item: Item) {
         if source.waiting() >= 2 {
-            noted(Noted::WakeTry);
-            if source.near.load(Ordering::Relaxed) {
-                pool().park.wake_one_near();
-            } else {
-                pool().park.wake_one();
-            }
+            let near = match item {
+                Item::Action { .. } => source.front_action_near(),
+                Item::Pieces(..) => source.near.load(Ordering::Relaxed),
+            };
+            wake_speculative(&pool().park, near);
         }
         match item {
             Item::Action { run, context, arg } => {
+                // Sound: `publish_actions` stored an `unsafe fn(*const (), u64, Platform)` function pointer and live `context` valid until completion.
                 let f: unsafe fn(*const (), u64, Platform) = unsafe { core::mem::transmute(run) };
                 unsafe { f(context as *const (), arg & !ACTION_SME2, pool_platform()) };
             }
@@ -3299,7 +3523,7 @@ pub(crate) mod sources {
             unsafe fn noop(_: *const (), _: u64, _: Platform) {}
             let source: &'static Source = &*Box::leak(Box::new(Source::with_actions(4)));
             let slot = source.register().expect("a free slot");
-            source.publish_actions(noop, core::ptr::null(), &[77]);
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[77], false) };
             let item = take_stream_item();
             Source::unregister(slot);
             assert!(matches!(item, Some(Item::Action { arg: 77, .. })));
@@ -3352,8 +3576,89 @@ pub(crate) mod sources {
             unsafe fn noop(_: *const (), _: u64, _: Platform) {}
             crate::initialize_multithreaded(core::num::NonZeroUsize::new(1));
             let source = Source::with_actions(2);
-            source.publish_actions(noop, core::ptr::null(), &[1, 2]);
-            source.publish_actions(noop, core::ptr::null(), &[3]);
+            unsafe {
+                source.publish_actions(noop, core::ptr::null(), &[1, 2], false);
+                source.publish_actions(noop, core::ptr::null(), &[3], false);
+            }
+        }
+
+        #[test]
+        #[cfg(not(shuttle))]
+        fn action_near_hint_is_per_ticket_across_mixed_publications() {
+            unsafe fn noop(_: *const (), _: u64, _: Platform) {}
+            let _ = pool();
+            let source = Source::with_actions(8);
+            assert!(!source.front_action_near(), "empty source has no front action");
+
+            // Near batch followed by a far room/group action: earlier near
+            // items keep near=true until all of them are claimed, then the
+            // trailing far item observes near=false.
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[101, 102, 103], true) };
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[200], false) };
+            assert!(source.front_action_near(), "head 101 stays near after trailing far publish");
+            assert!(source.take().is_some());
+            assert!(source.front_action_near(), "head 102 stays near");
+            assert!(source.take().is_some());
+            assert!(source.front_action_near(), "head 103 stays near");
+            assert!(source.take().is_some());
+            assert!(!source.front_action_near(), "head 200 is far");
+            assert!(source.take().is_some());
+            assert!(!source.front_action_near(), "drained source is false");
+
+            // Far large batch followed by a near batch: earlier far items keep
+            // near=false until drained, then the trailing near item sees true.
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[301, 302], false) };
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[400], true) };
+            assert!(!source.front_action_near(), "head 301 stays far after trailing near publish");
+            assert!(source.take().is_some());
+            assert!(!source.front_action_near(), "head 302 stays far");
+            assert!(source.take().is_some());
+            assert!(source.front_action_near(), "head 400 is near");
+            assert!(source.take().is_some());
+            assert!(!source.front_action_near());
+
+            // Fill a full ring of near=true items and drain all of them so
+            // slot `claimed % len` still holds `near == true` from the prior
+            // lap: an empty source (`c == p`) must still return false.
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[1, 2, 3, 4, 5, 6, 7, 8], true) };
+            for _ in 0..8 {
+                assert!(source.front_action_near());
+                assert!(source.take().is_some());
+            }
+            assert!(!source.front_action_near(), "drained ring with stale near slot returns false");
+
+            // Behavioral wake test on a synthetic two-place Park where the
+            // caller's local place (place 0) has NO parked worker (e.g., busy
+            // in an application waker callback) while place 1 has parked
+            // workers: speculative near wake leaves remote parked, speculative
+            // far wake spills to remote, and a progress wake (`wake_one`)
+            // always wakes remote even while the front action is near.
+            std::thread_local! {
+                static PLACE_HERE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+            }
+            let park = crate::park::test::park_with(4, 4, &[2, 3]);
+            // Place 0 = workers {0, 1} (busy), Place 1 = workers {2, 3} (parked).
+            park.set_places(
+                vec![vec![0b0011u64].into_boxed_slice(), vec![0b1100u64].into_boxed_slice()].into_boxed_slice(),
+                vec![vec![0b1111u64].into_boxed_slice(), vec![0b1111u64].into_boxed_slice()].into_boxed_slice(),
+                || PLACE_HERE.with(|p| p.get()),
+            );
+            PLACE_HERE.with(|p| p.set(0));
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[1, 2], true) };
+            unsafe { source.publish_actions(noop, core::ptr::null(), &[3], false) };
+            assert_eq!(park.parked_count(), 2);
+            wake_speculative(&park, source.front_action_near());
+            assert_eq!(park.parked_count(), 2, "speculative near wake keeps remote workers parked");
+            // Progress wake (as wake_for_waiting calls) wakes a remote worker
+            // even while the front waiting action is near.
+            assert!(park.wake_one(), "progress wake reaches remote worker when local place is busy");
+            assert_eq!(park.parked_count(), 1);
+            // Claim the two near items; head is now the trailing far item.
+            assert!(source.take().is_some() && source.take().is_some());
+            assert!(!source.front_action_near());
+            wake_speculative(&park, source.front_action_near());
+            assert_eq!(park.parked_count(), 0, "speculative far wake spills to remote worker");
+            assert!(source.take().is_some());
         }
 
         #[test]
@@ -3366,7 +3671,7 @@ pub(crate) mod sources {
             assert_eq!(source.actions_len(), 3);
             assert!(!source.run_waiting_action());
             let flag = AtomicU64::new(0);
-            source.publish_actions(set_val, (&flag as *const AtomicU64).cast(), &[42 | ACTION_SME2]);
+            unsafe { source.publish_actions(set_val, (&flag as *const AtomicU64).cast(), &[42 | ACTION_SME2], false) };
             assert!(source.run_waiting_action());
             assert_eq!(flag.load(Ordering::SeqCst), 42, "ACTION_SME2 bit stripped before running");
             assert!(!source.run_waiting_action());
@@ -3437,17 +3742,101 @@ pub(crate) mod sources {
             let in_turn: Vec<usize> = served.iter().copied().skip(TURN as usize).step_by(TURN as usize + 1).collect();
             assert_eq!(in_turn, (4..64).chain(0..4).collect::<Vec<_>>());
             assert!(lowest_first(&served));
-            // Nothing anywhere: a turn that is due finds nothing and says so.
+            // Nothing anywhere: a turn that is due finds nothing and preserves
+            // both `taken` and `cursor` across the empty walk (#465). When both
+            // slot 0 and the slot at `cursor` (slot 4) then become nonempty, the
+            // due turn must serve slot 4 rather than resetting to slot 0.
             for s in &sources {
                 s.claimed.store(s.finish.published.load(Ordering::SeqCst), Ordering::SeqCst);
             }
             turn.taken = TURN;
             assert!(!run_one_from(&mut turn, |_, _| panic!("nothing to serve")));
             sources[0].finish.published.fetch_add(1, Ordering::SeqCst);
+            sources[4].finish.published.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                run_one_from(&mut turn, |source, _| assert_eq!(slot_of(source), 4)),
+                "empty walk must preserve due turn and cursor across competing nonempty sources"
+            );
+            // Drain slot 0, then verify a due turn still wraps below its cursor.
+            assert!(run_one_from(&mut turn, |source, _| assert_eq!(slot_of(source), 0)));
+            turn.taken = TURN;
+            sources[0].finish.published.fetch_add(1, Ordering::SeqCst);
             assert!(run_one_from(&mut turn, |source, _| assert_eq!(slot_of(source), 0)), "a due turn still finds work below its cursor");
             for slot in slots {
                 Source::unregister(slot);
             }
+        }
+
+        /// The live worker loop (`Pool::serve`) persists its `Turn` across
+        /// iterations: a lower-slot source that continuously republishes work
+        /// before emptying cannot starve a higher-slot source (#465).
+        #[test]
+        #[cfg(not(shuttle))]
+        fn test_worker_loop_persists_turn_under_continuous_lower_source() {
+            use core::sync::atomic::AtomicBool;
+            struct State {
+                low: &'static Source,
+                stop: AtomicBool,
+                low_runs: AtomicU64,
+                high_ran: AtomicBool,
+            }
+            unsafe fn run_low(ctx: *const (), _arg: u64, _platform: Platform) {
+                // Sound: `ctx` points to a leaked `'static State`.
+                let st = unsafe { &*(ctx as *const State) };
+                st.low_runs.fetch_add(1, Ordering::Relaxed);
+                if !st.stop.load(Ordering::Acquire) {
+                    // Sound: `run_low` matches `unsafe fn(*const (), u64, Platform)` and
+                    // `low` has capacity 4 with at most 2 items in flight.
+                    unsafe { st.low.publish_actions(run_low, ctx, &[1], false) };
+                }
+            }
+            unsafe fn run_high(ctx: *const (), _arg: u64, _platform: Platform) {
+                // Sound: `ctx` points to a leaked `'static State`.
+                let st = unsafe { &*(ctx as *const State) };
+                st.stop.store(true, Ordering::Release);
+                st.high_ran.store(true, Ordering::Release);
+            }
+
+            // Two threads (1 caller + 1 worker): only the single worker serves
+            // these sources, so if `Pool::serve` reset `Turn` each iteration
+            // `low` would monopolize it forever and `high` would never run.
+            crate::initialize_multithreaded(core::num::NonZeroUsize::new(2));
+            if pool().workers() == 0 {
+                return;
+            }
+            let low: &'static Source = Box::leak(Box::new(Source::with_actions(4)));
+            let high: &'static Source = Box::leak(Box::new(Source::with_actions(2)));
+            let low_slot = low.register().expect("low slot");
+            let high_slot = high.register().expect("high slot");
+            assert!(low_slot < high_slot, "low slot ({low_slot}) must precede high slot ({high_slot})");
+            let state: &'static State =
+                Box::leak(Box::new(State { low, stop: AtomicBool::new(false), low_runs: AtomicU64::new(0), high_ran: AtomicBool::new(false) }));
+            let ctx = (state as *const State).cast::<()>();
+            // Seed `low` with 2 items so it stays continuously nonempty as the
+            // worker drains one and immediately republishes another, plus 1
+            // item on `high`.
+            // Sound: `run_low` / `run_high` match the action ABI and `ctx` is `'static`.
+            unsafe {
+                low.publish_actions(run_low, ctx, &[1, 2], false);
+                high.publish_actions(run_high, ctx, &[9], false);
+            }
+            pool().park.wake_one();
+            let deadline = now() + std::time::Duration::from_secs(5);
+            while !state.high_ran.load(Ordering::Acquire) {
+                if now() >= deadline {
+                    state.stop.store(true, Ordering::Release);
+                    panic!("higher-slot source starved after {} lower-slot runs (worker loop failed to persist Turn)", state.low_runs.load(Ordering::Relaxed));
+                }
+                std::thread::yield_now();
+            }
+            // Wait for any final in-flight `low` item to be claimed before unregistering.
+            let drain_deadline = now() + std::time::Duration::from_secs(2);
+            while low.waiting() > 0 && now() < drain_deadline {
+                pool().park.wake_one();
+                std::thread::yield_now();
+            }
+            Source::unregister(high_slot);
+            Source::unregister(low_slot);
         }
 
         #[test]
@@ -3535,7 +3924,7 @@ pub(crate) const TASK_LEN: usize = 64 * CHUNK_LEN;
 /// one message length), hashed side by side via [`Task::run_members`].
 pub(crate) struct Task {
     pub(crate) len: usize,
-    pub(crate) batch: Option<usize>,
+    pub(crate) batch: Option<(usize, usize)>,
     pub(crate) members: usize,
     pub(crate) member: [Member; MEMBERS],
 }
@@ -3553,31 +3942,44 @@ pub(crate) struct Member {
 
 const NO_MEMBER: Member = Member { input: core::ptr::null(), len: 0, out: core::ptr::null_mut() };
 
+// Sound: active prefix entries (`0..members`) carry caller-pinned input/output pointers synchronized by the task's claim/completion barrier; inactive trailing slots (`NO_MEMBER`) hold null pointers and are never dereferenced.
 unsafe impl Send for Task {}
 
 impl Task {
-    /// An empty task of short messages, or batches of one message length.
-    pub(crate) fn members(batch: Option<usize>) -> Task {
+    /// An empty task of short messages, or batches of one `(message_len, slot)` shape.
+    pub(crate) fn members(batch: Option<(usize, usize)>) -> Task {
         Task { len: 0, batch, members: 0, member: [NO_MEMBER; MEMBERS] }
     }
 }
 
 impl Task {
-    /// The members' digests: messages of one length side by side on the
-    /// multi-lane kernels (`hash_many`'s, from a table of pointers) where
-    /// that length is one block, or on x86 two to sixteen blocks of a power
-    /// of two (128 B to 1 KiB); any others one at a time.
-    pub(crate) fn run_members(&self, tree: &TreeHasher, platform: Platform) {
+    /// The members' digests: two or more messages of one length side by side on
+    /// the multi-lane kernels (`hash_many`'s, from a table of pointers) where
+    /// that length is 1, 2, 4, 8, or 16 whole blocks (64 B to 1 KiB) across all
+    /// architectures; any others one at a time.
+    ///
+    /// # Safety
+    ///
+    /// `self.members <= MEMBERS`, and for every active member `m` in
+    /// `self.member[..self.members]`: `m.input` must be valid for reads of
+    /// `m.len` initialized bytes (and for `self.batch = Some((message_len, slot))`,
+    /// whole slots of a validated `Prepared` batch — including zero-length
+    /// messages padded to `slot = BLOCK_LEN` — with trailing slot bytes zeroed),
+    /// and `m.out` must point to non-overlapping writable output space for the
+    /// member's digest(s) until completion is published.
+    pub(crate) unsafe fn run_members(&self, tree: &TreeHasher, platform: Platform) {
         let members = &self.member[..self.members];
-        if let Some(message_len) = self.batch {
+        if let Some((message_len, slot)) = self.batch {
             for m in members {
-                // Sound: the stream keeps each batch's bytes and digest
-                // space in place until the task's `left` is zero.
+                // Sound: the Pipeline keeps each batch's bytes and digest
+                // space in place until the group publishes `completed_epoch`.
                 let bytes = unsafe { core::slice::from_raw_parts(m.input, m.len) };
-                let slot = crate::slot_len(message_len);
                 let count = m.len / slot;
                 let digests = unsafe { core::slice::from_raw_parts_mut(m.out as *mut [u8; crate::OUT_LEN], count) };
-                tree.hash_slots_on(platform, bytes, message_len, slot, digests);
+                // Sound: the Pipeline keeps a validated `Prepared` batch's
+                // slots alive until the group publishes `completed_epoch`.
+                let part = unsafe { crate::throughput::Part::from_checked_slots(bytes, message_len, slot) };
+                tree.hash_many_on(platform, &part, digests);
             }
             return;
         }
@@ -3625,6 +4027,7 @@ fn sme2_serve() -> ! {
         if let Some(item) = sources::take_stream_item() {
             match item {
                 sources::Item::Action { run, context, arg } => {
+                    // Sound: `publish_actions` stored an `unsafe fn(*const (), u64, Platform)` function pointer and live `context` valid until completion.
                     let f: unsafe fn(*const (), u64, Platform) = unsafe { core::mem::transmute(run) };
                     if arg & sources::ACTION_SME2 == 0 {
                         unsafe { f(context as *const (), arg, pool_platform()) };
@@ -3758,8 +4161,12 @@ mod test {
         // thread below it would end that thread alone and leave the wait
         // waiting forever (a broken build's every mutant hung this test).
         let _ = pool();
-        let source = sources::job_source();
-        let target = source.publish_job(core::ptr::null_mut(), 1, 0, false);
+        let source: &'static sources::Source = Box::leak(Box::new(sources::Source::new()));
+        source.own_for_test();
+        // Sound: `source` is an isolated test-only Source never registered in
+        // the global pool registry; only our spawned worker thread claims it
+        // without dereferencing the null job pointer.
+        let target = unsafe { source.publish_job(core::ptr::null_mut(), 1, 0, false) };
         // An unpark this thread received earlier would let one park()
         // return at once and hide a missing wake-up.
         std::thread::park_timeout(core::time::Duration::ZERO);
@@ -3792,7 +4199,12 @@ mod test {
         platforms.extend([Platform::sse41(), Platform::avx2()].into_iter().flatten());
         #[cfg(blake3_avx512_ffi)]
         platforms.extend(Platform::avx512());
-        platforms.push(Platform::detect());
+        let detected = Platform::detect();
+        platforms.push(detected);
+        let own = Platform::own_core();
+        if own != detected && !platforms.contains(&own) {
+            platforms.push(own);
+        }
         let key = [0x5Au8; crate::KEY_LEN];
         let context = "equal queue members";
         let counts: &[usize] = &[2, 3, 4, 7, 8, 15, 16, 17, 63, MEMBERS];
@@ -3827,13 +4239,11 @@ mod test {
                                     task.member[m] = Member { input: inputs[m][offset..].as_ptr(), len: inputs[m].len() - offset, out };
                                 }
                                 crate::RAN.with(|r| r.set(0));
-                                task.run_members(&tree, platform);
+                                unsafe { task.run_members(&tree, platform) };
                                 // Which path (BLAKE3 #219): one length, two
-                                // members or more, a length with a kernel
-                                // (one block everywhere; 128 B to 1 KiB on
-                                // x86-64): side by side; else one at a time.
-                                let side_by_side =
-                                    !mixed && count >= 2 && (len == 64 || (cfg!(target_arch = "x86_64") && matches!(len, 128 | 256 | 512 | 1024)));
+                                // members or more, a power-of-two block length
+                                // (64 B to 1 KiB): side by side; else one at a time.
+                                let side_by_side = !mixed && count >= 2 && matches!(len, 64 | 128 | 256 | 512 | 1024);
                                 let ran = crate::RAN.with(|r| r.get());
                                 assert_eq!(
                                     ran & crate::Ran::EqualMembers as u32 != 0,
@@ -4035,6 +4445,24 @@ mod test {
         let refs: Vec<&[u8]> = eights.iter().map(|v| v.as_slice()).collect();
         assert_eq!(cut_items_vec(&refs, 2), tiling(&[(1, 8), (1, 4), (1, 2), (2, 1)]));
         assert_eq!(cut_items_vec(&[], 4), Vec::<Piece>::new());
+        // Weighted totals exceeding `usize::MAX` accumulate in `u128` and
+        // subtract cleanly back below the word boundary into exact cuts.
+        let mut pieces = Vec::new();
+        let huge = [usize::MAX / 2, usize::MAX / 2, usize::MAX / 2, 1024, 1024];
+        cut_items(&mut pieces, &huge, 4, |&w| w);
+        assert_eq!(pieces, tiling(&[(3, 1), (1, 2)]));
+        // Large items (>= MIN_SPLIT_LEN) weigh zero when filtered by the caller
+        // and are covered alongside smaller items without overflowing.
+        pieces.clear();
+        cut_items(&mut pieces, &huge, 4, |&n| if n >= MIN_SPLIT_LEN { 0 } else { n });
+        assert_eq!(pieces, vec![Piece { offset: 0, len: huge.len() }]);
+        // The planner's all-items saturating byte sum handles aliased totals
+        // past `usize::MAX`.
+        let saturated = huge.iter().fold(0usize, |acc, &n| acc.saturating_add(n));
+        assert_eq!(saturated, usize::MAX);
+        let plan = pool().plan(places::Kind::Each, saturated);
+        assert!(plan.threads >= 1);
+        plan.done();
     }
 
     /// Where the pool begins (BLAKE3 #219: a threshold between two correct
@@ -4072,6 +4500,49 @@ mod test {
             }),
             "at MIN_SPLIT_LEN: the pool"
         );
+        // Packed<16> and Packed<32> take one 64-byte compression per message,
+        // so both cross MIN_SPLIT_LEN at MIN_SPLIT_LEN / BLOCK_LEN messages.
+        let min_packed = MIN_SPLIT_LEN / crate::BLOCK_LEN;
+        let mut packed_out = std::vec![[0u8; crate::OUT_LEN]; min_packed];
+        let p16_under = crate::throughput::Packed::<16>::new(min_packed - 1);
+        let p16_at = crate::throughput::Packed::<16>::new(min_packed);
+        let p32_under = crate::throughput::Packed::<32>::new(min_packed - 1);
+        let p32_at = crate::throughput::Packed::<32>::new(min_packed);
+        assert!(
+            !went_to_pool(&mut || crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &p16_under, &mut packed_out[..min_packed - 1])),
+            "Packed<16> under MIN_SPLIT_LEN compressions: serial"
+        );
+        assert!(
+            went_to_pool(&mut || crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &p16_at, &mut packed_out)),
+            "Packed<16> at MIN_SPLIT_LEN compressions: the pool"
+        );
+        assert!(
+            !went_to_pool(&mut || crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &p32_under, &mut packed_out[..min_packed - 1])),
+            "Packed<32> under MIN_SPLIT_LEN compressions: serial"
+        );
+        assert!(
+            went_to_pool(&mut || crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &p32_at, &mut packed_out)),
+            "Packed<32> at MIN_SPLIT_LEN compressions: the pool"
+        );
+        // Digest-oracle check in the newly split band with distinct inputs and a non-power-of-two tail.
+        let tail_count = min_packed + 37;
+        let mut p16_tail = crate::throughput::Packed::<16>::new(tail_count);
+        let mut p32_tail = crate::throughput::Packed::<32>::new(tail_count);
+        for i in 0..tail_count {
+            let b0 = (i & 0xff) as u8;
+            let b1 = ((i >> 8) & 0xff) as u8;
+            p16_tail[i] = [b0, b1, b0 ^ 0x5A, b1 ^ 0xA5, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            p32_tail[i][..16].copy_from_slice(&p16_tail[i]);
+            p32_tail[i][16..].fill(b0.wrapping_add(b1));
+        }
+        let mut out16 = std::vec![[0u8; crate::OUT_LEN]; tail_count];
+        let mut out32 = std::vec![[0u8; crate::OUT_LEN]; tail_count];
+        assert!(went_to_pool(&mut || crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &p16_tail, &mut out16)), "Packed<16> tail batch uses pool");
+        assert!(went_to_pool(&mut || crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &p32_tail, &mut out32)), "Packed<32> tail batch uses pool");
+        for i in 0..tail_count {
+            assert_eq!(out16[i], *blake3_servil_core::convenience::hash(&p16_tail[i]).as_bytes(), "Packed<16> msg {i}");
+            assert_eq!(out32[i], *blake3_servil_core::convenience::hash(&p32_tail[i]).as_bytes(), "Packed<32> msg {i}");
+        }
     }
 
     const US: fn(u64) -> std::time::Duration = std::time::Duration::from_micros;
@@ -4124,7 +4595,7 @@ mod test {
         let _ = pool();
         unsafe fn noop(_: *const (), _: u64, _: Platform) {}
         let source: &'static sources::Source = Box::leak(Box::new(sources::Source::with_actions(8)));
-        let pub1 = || source.publish_actions(noop, core::ptr::null(), &[0]);
+        let pub1 = || unsafe { source.publish_actions(noop, core::ptr::null(), &[0], false) };
         counts();
         pub1();
         assert_eq!(counts()[Noted::WakeTry as usize], 0, "one task waiting: the caller's");
@@ -4327,7 +4798,7 @@ mod test {
             task.members = 1;
             task.member[0] = Member { input: input.as_ptr(), len, out: out.as_mut_ptr().cast::<u8>() };
             crate::RAN.with(|r| r.set(0));
-            task.run_members(&TreeHasher::new(crate::Mode::Plain), Platform::detect());
+            unsafe { task.run_members(&TreeHasher::new(crate::Mode::Plain), Platform::detect()) };
             let ran = crate::RAN.with(|r| r.get());
             assert!(ran & crate::Ran::MemberAlone as u32 != 0 && ran & crate::Ran::EqualMembers as u32 == 0, "{len} B alone");
             assert_eq!(out[0], *crate::convenience::hash(&input).as_bytes());
@@ -4731,5 +5202,75 @@ mod test {
         while !all_parked() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// Calling synchronous multithreaded APIs from a thread-local destructor
+    /// after `SCRATCH` and `MINE` have already been destroyed must fall back
+    /// cleanly to serial hashing without panicking.
+    #[test]
+    fn pool_calls_inside_tls_destructor_succeed() {
+        crate::initialize_multithreaded(std::num::NonZeroUsize::new(2));
+        let ran = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let ok = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        struct OnExit {
+            ran: std::sync::Arc<core::sync::atomic::AtomicBool>,
+            ok: std::sync::Arc<core::sync::atomic::AtomicBool>,
+        }
+        impl Drop for OnExit {
+            fn drop(&mut self) {
+                self.ran.store(true, Ordering::SeqCst);
+                crate::initialize_multithreaded(None);
+                let data = vec![crate::throughput::Block([0x5Au8; 64]); (MIN_SPLIT_LEN + 1024) / 64];
+                let bytes = crate::throughput::Block::bytes(&data);
+                let expected = *blake3::hash(bytes).as_bytes();
+                let got_whole = crate::throughput::hash_multithreaded(crate::Mode::Plain, &data, bytes.len());
+                let batch = crate::throughput::Batch::from_blocks(&data, 64);
+                let mut batch_out = vec![[0u8; 32]; batch.len()];
+                crate::throughput::hash_many_multithreaded(crate::Mode::Plain, &batch, &mut batch_out);
+                let expected_block = *blake3::hash(&[0x5Au8; 64]).as_bytes();
+                let item_blocks = vec![crate::throughput::Block([0x3Cu8; 64]); 32];
+                let items = vec![(&item_blocks[..], 2048); 300];
+                let mut each_out = vec![[0u8; 32]; items.len()];
+                crate::throughput::hash_each_multithreaded(crate::Mode::Plain, &items, &mut each_out);
+                let expected_item = *blake3::hash(&[0x3Cu8; 2048]).as_bytes();
+                if *got_whole.as_bytes() == expected && batch_out[0] == expected_block && each_out[0] == expected_item {
+                    self.ok.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        std::thread_local! {
+            static EARLIER: core::cell::RefCell<Option<OnExit>> = const { core::cell::RefCell::new(None) };
+        }
+        let ran_c = std::sync::Arc::clone(&ran);
+        let ok_c = std::sync::Arc::clone(&ok);
+        std::thread::spawn(move || {
+            // Initialize EARLIER first so LIFO TLS teardown destroys SCRATCH,
+            // MINE, and any SME2 scratch TLS before EARLIER's Drop runs.
+            EARLIER.with(|slot| *slot.borrow_mut() = Some(OnExit { ran: ran_c, ok: ok_c }));
+            crate::initialize_multithreaded(None);
+            let warmup = vec![crate::throughput::Block([0x11u8; 64]); (MIN_SPLIT_LEN + 1024) / 64];
+            let _ = crate::throughput::hash_multithreaded(crate::Mode::Plain, &warmup, crate::throughput::Block::bytes(&warmup).len());
+        })
+        .join()
+        .expect("pool calls during TLS teardown must not panic");
+        assert!(ran.load(Ordering::SeqCst), "TLS destructor must have run");
+        assert!(ok.load(Ordering::SeqCst), "TLS destructor hashes must match reference");
+
+        // Second thread: initialize SCRATCH *before* EARLIER and MINE *after*
+        // EARLIER so only MINE is destroyed while SCRATCH is still live when
+        // EARLIER's Drop runs.
+        ran.store(false, Ordering::SeqCst);
+        ok.store(false, Ordering::SeqCst);
+        let ran_c = std::sync::Arc::clone(&ran);
+        let ok_c = std::sync::Arc::clone(&ok);
+        std::thread::spawn(move || {
+            SCRATCH.with(|s| s.borrow_mut().pieces.reserve(1));
+            EARLIER.with(|slot| *slot.borrow_mut() = Some(OnExit { ran: ran_c, ok: ok_c }));
+            let _ = sources::job_source();
+        })
+        .join()
+        .expect("pool calls with only MINE destroyed must not panic");
+        assert!(ran.load(Ordering::SeqCst), "second TLS destructor must have run");
+        assert!(ok.load(Ordering::SeqCst), "second TLS destructor hashes must match reference");
     }
 }

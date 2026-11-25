@@ -317,42 +317,6 @@ fn test_hash_each_multithreaded() {
     }
 }
 
-/// Many hashers fed in turns of interleaved pieces of many lengths
-/// through update_each_multithreaded, finished by finalize_each: every
-/// digest the one-shot hash's.
-#[test]
-fn test_update_each_multithreaded() {
-    crate::initialize_multithreaded(None);
-    let mut input = vec![0u8; 1 << 20];
-    crate::test::paint_test_input(&mut input);
-    let lens = [0, 1, 63, 64, 1023, 1024, 1025, 2048, 4470, 8191, 16384, 16385, 65536, 100_000, 300_000];
-    let piece_lens = [1, 1448, 4096, 1448, 16384, 31, 65536];
-    let key = [5u8; 32];
-    // Every third hasher keyed: a turn's held groups in two kinds.
-    let mut hashers: Vec<Hasher> =
-        (0..lens.len()).map(|i| if i % 3 == 1 { Hasher::new(Mode::Keyed(&key), None) } else { Hasher::new(Mode::Plain, None) }).collect();
-    let mut done = vec![0usize; lens.len()];
-    let mut k = 0;
-    while done.iter().zip(&lens).any(|(d, l)| d < l) {
-        let mut pieces: Vec<(usize, &[u8])> = Vec::new();
-        for _ in 0..23 {
-            let i = k % lens.len();
-            let n = piece_lens[k % piece_lens.len()].min(lens[i] - done[i]);
-            pieces.push((i, &input[done[i]..done[i] + n]));
-            done[i] += n;
-            k += 1;
-        }
-        throughput::update_each_multithreaded(&mut hashers, &pieces);
-    }
-    let which: Vec<usize> = (0..lens.len()).rev().collect();
-    let mut out = vec![[0u8; OUT_LEN]; lens.len()];
-    throughput::finalize_each(&mut hashers, &which, &mut out);
-    for (k, &i) in which.iter().enumerate() {
-        let want = if i % 3 == 1 { crate::convenience::hash_with(Mode::Keyed(&key), &input[..lens[i]]) } else { crate::convenience::hash(&input[..lens[i]]) };
-        assert_eq!(&out[k], want.as_bytes(), "len {}", lens[i]);
-    }
-}
-
 fn packed<const N: usize>(count: usize, seed: u8) -> Packed<N> {
     let mut leaves = Packed::<N>::new(count);
     for (i, leaf) in leaves.iter_mut().enumerate() {
@@ -387,18 +351,19 @@ fn packed_messages_hash_multithreaded_as_each_message_alone() {
     }
 }
 
-/// Blocks borrowed that hold no whole number of messages are refused by
-/// hash_many_multithreaded above the pool's split, as hash_many refuses
-/// them: before the 0.10 fixes' own review (BLAKE3 #461) it hashed the
-/// whole messages and passed over the ragged end.
+/// A valid whole batch above the pool split with too few output slots is
+/// refused by `hash_many_multithreaded` before `batch.part(0..out.len())`
+/// can silently hash a prefix.
 #[test]
 #[should_panic(expected = "input holds one slot per output")]
-fn a_ragged_borrowed_batch_is_refused_above_the_split() {
+fn a_short_output_slice_is_refused_above_the_split() {
     crate::initialize_multithreaded(None);
-    // Messages of two blocks in an odd number of blocks, 640,064 bytes.
-    let blocks = vec![Block::ZERO; 2 * 5000 + 1];
-    let mut out = vec![[0u8; 32]; 5000];
-    throughput::hash_many_multithreaded(Mode::Plain, &Batch::from_blocks(&blocks, 128), &mut out);
+    // 5,000 messages of 128 bytes (640,000 bytes, above MIN_SPLIT_LEN),
+    // with one output slot missing.
+    let blocks = vec![Block::ZERO; 2 * 5000];
+    let batch = Batch::from_blocks(&blocks, 128);
+    let mut out = vec![[0u8; 32]; 4999];
+    throughput::hash_many_multithreaded(Mode::Plain, &batch, &mut out);
 }
 
 /// hash_many_multithreaded of messages of 2 to 16 whole blocks, at counts

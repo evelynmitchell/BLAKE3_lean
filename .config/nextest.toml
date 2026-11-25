@@ -14,6 +14,16 @@
 # sit well above every test there.
 slow-timeout = { period = "60s", terminate-after = 1 }
 
+[profile.ci]
+# Shared multi-tenant GitHub Actions VMs (notably ubuntu-24.04-arm) fluctuate
+# on 2-second wall-clock throughput ratios (`two_callers_share_the_pool`
+# routinely failed at ~1.68x vs the 1.5x bound due to host vCPU scheduling).
+# The clockless fairness tests (`lanes::sources::test`) still run on every CI
+# runner, and `pool_fairness` still runs under the default profile on our
+# dedicated native fleet hosts (`x86-workhorse`, `arm-vm`, `mac-m6-build`).
+slow-timeout = { period = "60s", terminate-after = 1 }
+default-filter = "not test(two_callers_share_the_pool)"
+
 [profile.emulated]
 # CI's x86_widths job: the suites under Intel's emulator, as a CPU the
 # runner is not (BLAKE3 #346). A test runs tens of times slower there: on
@@ -24,7 +34,13 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 # test_wide_bit_matches_cpuinfo compares the CPU's own report (emulated)
 # with the kernel's /proc/cpuinfo (the real machine's): as an Ice Lake
 # server on an AMD Zen 5 runner the two differ, as they should.
-default-filter = "not test(test_wide_bit_matches_cpuinfo)"
+# two_callers_share_the_pool measures 2-second wall-clock throughput parity,
+# which fluctuates on virtualized/emulated CI runners (just as under mutants).
+# binary(build_version) spawns `git` and `cargo build` to verify crate version
+# strings (zero SIMD/assembly instructions); under Intel SDE it wasted 166.5
+# CPU-seconds per job emulating `git` and `rustc` while already running
+# natively on Linux stable/nightly, GCC 12, arm-vm, and mac-m6-build.
+default-filter = "not test(test_wide_bit_matches_cpuinfo) and not test(two_callers_share_the_pool) and not binary(build_version)"
 
 [profile.mutants]
 # A mutant's tests stop at the first that fails, and the tests still running

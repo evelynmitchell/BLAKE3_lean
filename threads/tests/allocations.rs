@@ -202,49 +202,6 @@ fn worker_counter_sees_an_owned_background_allocation() {
     assert_eq!(work, Counts { allocations: 1, deallocations: 1, bytes: 4096, ..Counts::default() });
 }
 
-/// Setup precedes the first measured cycle. Grouped whole-message updates
-/// reach the pool as well as the caller; output consumption and the
-/// resets remain inside three complete cycles (#325).
-#[test]
-fn prepared_multithreaded_cycles_include_the_workers() {
-    pool_ready(4);
-    let inputs: Vec<_> = (0..3).map(|i| vec![37u8 + i; 4 << 20]).collect();
-    let keys = [[19u8; 32], [91u8; 32]];
-    for shared in [true, false] {
-        let mode = |i| match i {
-            0 => Mode::Plain,
-            2 => Mode::DeriveKey("prepared worker allocation cycles"),
-            _ => Mode::Keyed(&keys[usize::from(!shared && i == 3)]),
-        };
-        let mut hashers: Vec<_> = (0..4).map(|i| Hasher::new(mode(i), None)).collect();
-        let which = [0usize, 1, 2, 3];
-        let mut pieces = Vec::with_capacity(4);
-        let mut outputs = vec![[0u8; 32]; 3 * 4];
-        let work = counts_with_workers(|| {
-            for (input, out) in inputs.iter().zip(outputs.chunks_mut(4)) {
-                pieces.clear();
-                pieces.extend((0..4).map(|i| (i, &input[..])));
-                throughput::update_each_multithreaded(&mut hashers, &pieces);
-                throughput::finalize_each(&mut hashers, &which, out);
-                let consumed = out.as_flattened().iter().fold(0usize, |sum, &b| sum.wrapping_add(b as usize));
-                std::hint::black_box(consumed);
-            }
-        });
-        assert_eq!(work, Counts::default(), "prepared worker cycles, shared={shared}");
-        for (input, out) in inputs.iter().zip(outputs.chunks(4)) {
-            for (i, digest) in out.iter().enumerate() {
-                let expected = match mode(i) {
-                    Mode::Plain => *blake3::hash(input).as_bytes(),
-                    Mode::Keyed(k) => *blake3::keyed_hash(k, input).as_bytes(),
-                    Mode::DeriveKey(c) => blake3::derive_key(c, input),
-                    _ => unreachable!("the test's three modes"),
-                };
-                assert_eq!(*digest, expected);
-            }
-        }
-    }
-}
-
 /// Only key bytes vary: caller preparation stays outside the allocator
 /// counters. Three complete cycles cover first use, reset and storage reuse;
 /// each input has two held stages (zero and nonzero chunk counters).
@@ -307,6 +264,49 @@ fn grouped_cycles_reuse_storage_for_every_key_prefix() {
     }
 }
 
+/// Setup precedes the first measured cycle. Whole-message updates through
+/// `update_multithreaded` reach the pool as well as the caller (its
+/// callback, `lanes::subtree_halves`, has no other allocation test); output consumption and the
+/// resets remain inside three complete cycles (#325).
+#[test]
+fn prepared_multithreaded_cycles_include_the_workers() {
+    pool_ready(4);
+    let inputs: Vec<_> = (0..3).map(|i| vec![37u8 + i; 4 << 20]).collect();
+    let keys = [[19u8; 32], [91u8; 32]];
+    for shared in [true, false] {
+        let mode = |i| match i {
+            0 => Mode::Plain,
+            2 => Mode::DeriveKey("prepared worker allocation cycles"),
+            _ => Mode::Keyed(&keys[usize::from(!shared && i == 3)]),
+        };
+        let mut hashers: Vec<_> = (0..4).map(|i| Hasher::new(mode(i), None)).collect();
+        let which = [0usize, 1, 2, 3];
+        let mut outputs = vec![[0u8; 32]; 3 * 4];
+        let work = counts_with_workers(|| {
+            for (input, out) in inputs.iter().zip(outputs.chunks_mut(4)) {
+                for hasher in hashers.iter_mut() {
+                    throughput::update_multithreaded(hasher, input);
+                }
+                throughput::finalize_each(&mut hashers, &which, out);
+                let consumed = out.as_flattened().iter().fold(0usize, |sum, &b| sum.wrapping_add(b as usize));
+                std::hint::black_box(consumed);
+            }
+        });
+        assert_eq!(work, Counts::default(), "prepared worker cycles, shared={shared}");
+        for (input, out) in inputs.iter().zip(outputs.chunks(4)) {
+            for (i, digest) in out.iter().enumerate() {
+                let expected = match mode(i) {
+                    Mode::Plain => *blake3::hash(input).as_bytes(),
+                    Mode::Keyed(k) => *blake3::keyed_hash(k, input).as_bytes(),
+                    Mode::DeriveKey(c) => blake3::derive_key(c, input),
+                    _ => unreachable!("the test's three modes"),
+                };
+                assert_eq!(*digest, expected);
+            }
+        }
+    }
+}
+
 /// Repeated indices, empty pieces and uneven initial stages around the
 /// ready table's boundary, in adjacent and interleaved caller order.
 #[test]
@@ -322,7 +322,7 @@ fn grouped_fragmentation_reuses_storage_at_table_boundaries() {
     let expected = [*blake3::hash(&input).as_bytes(), *blake3::keyed_hash(&key, &input).as_bytes(), blake3::derive_key("bounded grouped storage", &input)];
     for n in [1usize, 127, 128, 129, 257] {
         for interleaved in [false, true] {
-            for pooled in [false, true] {
+            {
                 for piece_len in [4093, 4096] {
                     let mut hashers: Vec<_> = (0..n)
                         .map(|i| {
@@ -342,14 +342,10 @@ fn grouped_fragmentation_reuses_storage_at_table_boundaries() {
                     let which: Vec<_> = (0..n).collect();
                     let mut outputs = vec![[0; 32]; n];
                     let work = counts(|| {
-                        if pooled {
-                            throughput::update_each_multithreaded(&mut hashers, &pieces);
-                        } else {
-                            throughput::update_each(&mut hashers, &pieces);
-                        }
+                        throughput::update_each(&mut hashers, &pieces);
                         throughput::finalize_each(&mut hashers, &which, &mut outputs);
                     });
-                    assert_eq!(work, Counts::default(), "n={n} interleaved={interleaved} pooled={pooled} piece_len={piece_len}");
+                    assert_eq!(work, Counts::default(), "n={n} interleaved={interleaved} piece_len={piece_len}");
                     for (i, output) in outputs.iter().enumerate() {
                         assert_eq!(*output, expected[i % 3]);
                     }
@@ -449,6 +445,28 @@ fn prepared_pool_calls_allocate_nothing() {
     for (item, digest) in items.iter().zip(&out).step_by(97) {
         assert_eq!(*digest, *blake3::hash(&Block::bytes(item.0)[..item.1]).as_bytes());
     }
+    // Worst-case CV-per-byte ratio: 127 items of 1,025 bytes (two chunks each)
+    // followed by a 15-chunk item (15,360 bytes) = 269 CVs in one 128 KiB piece.
+    let mut dense_items: Vec<(&[Block], usize)> = Vec::new();
+    let mut off = 0;
+    for _ in 0..8 {
+        for _ in 0..127 {
+            let blks = 1025usize.div_ceil(64);
+            dense_items.push((&message[off..off + blks], 1025));
+            off += blks;
+        }
+        let blks = (15 * 1024) / 64;
+        dense_items.push((&message[off..off + blks], 15 * 1024));
+        off += blks;
+    }
+    let mut dense_out = vec![[0u8; 32]; dense_items.len()];
+    let dense = counts_with_workers(|| throughput::hash_each_multithreaded(Mode::Plain, &dense_items, &mut dense_out));
+    assert_eq!(dense, Counts::default(), "worst-case 1,025 B + 15 KiB pooled collection allocates nothing");
+    for (idx, (item, digest)) in dense_items.iter().zip(&dense_out).enumerate() {
+        if idx % 64 == 0 || idx % 128 == 127 {
+            assert_eq!(*digest, *blake3::hash(&Block::bytes(item.0)[..item.1]).as_bytes(), "dense item {idx}");
+        }
+    }
 }
 
 fn blocks(len: usize, seed: u8) -> Vec<Block> {
@@ -461,17 +479,28 @@ fn blocks(len: usize, seed: u8) -> Vec<Block> {
 
 #[test]
 fn single_threaded_calls_allocate_as_the_memory_section_says() {
-    blake3_servil::initialize();
+    assert_eq!(allocated(blake3_servil::initialize), 0, "startup initialize() allocates nothing");
     let input = blocks(64 * 1024, 1);
     let bytes = Block::bytes(&input);
     let mut out = [0u8; 100];
     for len in [0, 1, 64, 1024, 1025, 16 * 1024, 64 * 1024] {
+        // On SME2, the very first flat walk (>= 32 KiB) on a thread allocates
+        // its one-time 64 KiB aligned scratch box; every call thereafter
+        // allocates nothing.
+        let first = allocated(|| {
+            std::hint::black_box(convenience::hash(&bytes[..len]));
+        });
+        if len >= 32 * 1024 && blake3_servil_core::thread_support::Platform::detect().name() == "SME2" {
+            assert!(first <= 64 * 1024 + 4096, "first SME2 flat walk allocated {first} B");
+        } else {
+            assert_eq!(first, 0, "convenience::hash of {len} B");
+        }
         assert_eq!(
             allocated(|| {
                 std::hint::black_box(convenience::hash(&bytes[..len]));
             }),
             0,
-            "convenience::hash of {len} B"
+            "repeated convenience::hash of {len} B"
         );
         assert_eq!(
             allocated(|| {
@@ -530,6 +559,8 @@ fn pipeline_allocates_nothing_after_creation() {
     let mut owned_bufs: Vec<Vec<u8>> = vec![vec![0x11; 64], vec![0x22; 200_000], vec![0x33; 1 << 20]];
     let lent_short = vec![0x44u8; 512];
     let lent_long = vec![0x55u8; (1 << 20) + 123];
+    let custom_key = [0x77u8; 32];
+    let custom_dk = [0x88u8; 32];
     let mut batch_holder = Some((Batch::new(64, 512), vec![[0u8; 32]; 512].into_boxed_slice()));
     let stream_data = vec![0x66u8; 3 * ROOM_LEN + 700];
 
@@ -558,9 +589,16 @@ fn pipeline_allocates_nothing_after_creation() {
                 }
             });
 
-            // 2. Owned messages (Vecs moved in and recovered without reallocation)
+            // 2. Owned messages (Vecs moved in and recovered without reallocation),
+            //    exercising both default `message` and per-message `message_with`.
+            let mut owned_idx = 0usize;
             while let Some(buf) = owned_bufs.pop() {
-                let m = block_on(pipeline.message(200, None));
+                let m = match owned_idx % 3 {
+                    0 => block_on(pipeline.message(200, None)),
+                    1 => block_on(pipeline.message_with(Mode::Keyed(&custom_key), 200, None)),
+                    _ => block_on(pipeline.message_with(Mode::DeriveKeyWith(&custom_dk), 200, None)),
+                };
+                owned_idx += 1;
                 pipeline.owned(m, buf);
             }
 
@@ -596,4 +634,67 @@ fn pipeline_allocates_nothing_after_creation() {
     });
 
     assert_eq!(work, Counts::default(), "Pipeline allocated after creation: {work:?}");
+}
+
+/// Preparing a thread after a large `hash_each` collection (and an empty
+/// collection) must not reallocate or grow already-sufficient thread-local
+/// scratch buffers.
+#[test]
+fn prepare_after_large_and_empty_collection_allocates_nothing() {
+    pool_ready(1);
+    let data = blocks(2 * 1024, 9);
+    let items: Vec<(&[Block], usize)> = vec![(&data, 2 * 1024); 4096];
+    let mut out = vec![[0u8; 32]; 4096];
+    throughput::hash_each(Mode::Plain, &items, &mut out);
+    assert_eq!(out[0], *blake3::hash(Block::bytes(&data)).as_bytes());
+    let mut empty: [[u8; 32]; 0] = [];
+    throughput::hash_each(Mode::Plain, &[], &mut empty);
+    let prep = counts(|| blake3_servil::initialize_multithreaded(std::num::NonZeroUsize::new(1)));
+    assert_eq!(prep, Counts::default(), "already-sufficient TLS scratch must not reallocate: {prep:?}");
+}
+
+/// Repeated `initialize_multithreaded` after a real nonempty pooled job must
+/// not reallocate or grow already-sufficient pool-piece scratch buffers.
+#[test]
+fn prepare_after_pooled_job_allocates_nothing() {
+    pool_ready(4);
+    let data = blocks(1 << 20, 13);
+    let got = throughput::hash_multithreaded(Mode::Plain, &data, 1 << 20);
+    assert_eq!(got, convenience::hash(Block::bytes(&data)));
+    let prep = counts(|| blake3_servil::initialize_multithreaded(std::num::NonZeroUsize::new(4)));
+    assert_eq!(prep, Counts::default(), "already-sufficient pool scratch must not reallocate after pooled job: {prep:?}");
+}
+
+/// Dropping a quiescent `Pipeline` holding an unreaped pending `Batch` must
+/// deallocate every per-Pipeline allocation (including `RawSlots` backing and
+/// both the pending `Batch` and digest box) with zero leaked allocations.
+#[test]
+fn dropping_pipeline_frees_raw_slots_and_pending_batches() {
+    use blake3_servil::throughput::{Limits, Pipeline, block_on};
+    pool_ready(2);
+    // Warm up reusable storage and FREE_STORAGES capacity first.
+    let warm = Pipeline::<u32, [u8; 64]>::with_owners(Mode::Plain, Limits { messages: 4, rooms: 0 });
+    drop(warm);
+    let mut pipe = None;
+    let create = counts(|| {
+        pipe = Some(Pipeline::<u32, [u8; 64]>::with_owners(Mode::Plain, Limits { messages: 4, rooms: 0 }));
+    });
+    let mut pipe = pipe.unwrap();
+    let msg = block_on(pipe.message(1, None));
+    let (batch_allocs, (batch, digests)) = {
+        let mut out = None;
+        let c = counts(|| {
+            out = Some((Batch::new(64, 2), vec![[0u8; 32]; 2].into_boxed_slice()));
+        });
+        (c, out.unwrap())
+    };
+    // Short batch stays buffered locally in open_group, so Pipeline::drop drops
+    // it quietly and frees both allocations alongside RawSlots.
+    pipe.batch(msg, batch, digests);
+    let dropped = counts(|| drop(pipe));
+    assert_eq!(
+        dropped.deallocations,
+        create.allocations + batch_allocs.allocations,
+        "Pipeline::drop must free every per-Pipeline allocation (create={create:?}, batch={batch_allocs:?}, dropped={dropped:?})"
+    );
 }

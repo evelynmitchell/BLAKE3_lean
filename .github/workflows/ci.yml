@@ -26,16 +26,43 @@ jobs:
     # GitHub's implicit 360. GitHub reports a job past it as timed out, not failed.
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-    - name: Long-proof cache identity
-      run: python3 -m unittest discover -s tools/verify -p test_long_proof_inputs.py -v
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh stable rustfmt
     - name: cargo fmt --check, in each crate
       run: for d in $(git ls-files '*Cargo.toml' | xargs -n1 dirname); do (cd "$d" && cargo fmt --all -- --check) || exit 1; done
-    - name: Release-tool controls
-      run: python3 tools/test_one_assignee.py && python3 tools/test_release_check.py && python3 tools/test_release_artifacts.py && python3 tools/test_gen_ver.py && python3 tools/test_land.py && python3 tools/test_unsafe_reasons.py && python3 tools/unsafe_reasons.py && python3 tools/test_pipeline_model_controls.py && python3 tools/test_api.py
+
+  # Both locked resolutions — the release workspace
+  # (tools/release/Cargo.lock) and standalone b3sum (b3sum/Cargo.lock) —
+  # under every feature, against the policy (deny.toml: advisories, yanked
+  # versions, sources, licences) and the audits (tools/release/supply-chain/:
+  # a published audit or a recorded exemption for each version); and no
+  # package taken by path but the four. CONTRIBUTING.md, "The dependency
+  # policy". Both tools are fetched by their hashes, and the release's cargo
+  # reads the locks.
+  dependency_policy:
+    name: "dependency policy (cargo-deny, cargo-vet)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        # tools/gen-ver.py --check reads HEAD^ on a stamped release commit.
+        fetch-depth: 2
+    - name: cargo-deny 0.22.0 and cargo-vet 0.10.4, by their hashes
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSfL -o /tmp/cargo-deny.tar.gz https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz
+        echo "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786  /tmp/cargo-deny.tar.gz" | sha256sum -c
+        tar zxf /tmp/cargo-deny.tar.gz -C /tmp --strip-components=1 --wildcards '*/cargo-deny'
+        install -m 755 /tmp/cargo-deny ~/.cargo/bin/cargo-deny
+        curl --proto '=https' --tlsv1.2 -sSfL -o /tmp/cargo-vet.tar.xz https://github.com/mozilla/cargo-vet/releases/download/v0.10.4/cargo-vet-x86_64-unknown-linux-gnu.tar.xz
+        echo "e367f8ac156208711511274abab0c309e19ed0f11ef2bbe8a7b0294f824cb032  /tmp/cargo-vet.tar.xz" | sha256sum -c
+        tar Jxf /tmp/cargo-vet.tar.xz -C /tmp --strip-components=1 --wildcards '*/cargo-vet'
+        install -m 755 /tmp/cargo-vet ~/.cargo/bin/cargo-vet
+        rm -f /tmp/cargo-deny.tar.gz /tmp/cargo-deny /tmp/cargo-vet.tar.xz /tmp/cargo-vet
+    - run: sh tools/ci-rust.sh stable
+    - run: python3 tools/gen-ver.py --check
+    - run: python3 tools/dependency_policy.py
+    - run: python3 tools/dependency_policy.py controls
 
   library_tests:
     name: ${{ matrix.target.name }} ${{ matrix.channel }}
@@ -53,49 +80,43 @@ jobs:
         channel: ["stable", "nightly"]
 
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ format('{0}-{1}', matrix.channel, matrix.target.toolchain) }}
-    - uses: taiki-e/install-action@nextest
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-c@0.10.26
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh ${{ matrix.channel }}
+    - run: sh tools/ci-tools.sh nextest cargo-c
     # The compiler and the instruction sets, for debugging (the two tools
     # that printed them went in d6390649).
     - name: print compiler version and instruction set support
       run: rustc -vV && grep -m1 -E '^(flags|Features)' /proc/cpuinfo
     # The tests run under cargo-nextest, each in its own process (AGENTS:
     # "Tests run under nextest"); the doc examples under cargo test --doc.
-    # Default tests plus the optional trait implementations (every public
-    # feature).
-    - run: cargo nextest run --features=serde
-    - run: cargo test --doc --features=serde
-    # no_std tests.
-    - run: cargo nextest run --no-default-features
+    # Every Cargo build and test runs --locked against tools/release/Cargo.lock
+    # via tools/ci-locked.sh.
+    - run: sh tools/ci-locked.sh nextest run -p blake3-servil-core
+    - run: sh tools/ci-locked.sh test --doc -p blake3-servil-core
+    # no_std library checks (--lib leaves #[cfg(test)] off so dead-code
+    # warnings surface under -D warnings) and no_std tests.
+    - run: sh tools/ci-locked.sh check -p blake3-servil-core --lib --no-default-features
+    - run: sh tools/ci-locked.sh nextest run -p blake3-servil-core --no-default-features
     - name: Make sure enabling LTO via CFLAGS doesn't break the build.
-      run: cargo build --tests
+      run: sh tools/ci-locked.sh build -p blake3-servil-core --tests
       env:
         CFLAGS: -flto
 
-    # The test profile (optimized, its assertions and overflow checks on:
-    # Cargo.toml), and the release profile, for the optimizer's own
-    # behavior.
-    - run: cargo nextest run --features=
-    - run: cargo nextest run --features= --release
+    # The release profile, for the optimizer's own behavior (default profile
+    # already ran above).
+    - run: sh tools/ci-locked.sh nextest run -p blake3-servil-core --release
     # The crate with the pool and the stream (threads/).
     - name: threads
-      run: cargo nextest run --no-fail-fast && cargo nextest run --release && cargo test --doc
-      working-directory: ./threads
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil -P ci --no-fail-fast && sh tools/ci-locked.sh nextest run -p blake3-servil -P ci --release && sh tools/ci-locked.sh test --doc -p blake3-servil
 
     # Test vectors.
     - name: test vectors
-      run: cargo nextest run
-      working-directory: ./test_vectors
+      run: sh tools/ci-locked.sh nextest run -p test_vectors
     # The C API (capi/: b3.h over the crate).
     - name: C API
-      run: cargo nextest run --release
-      working-directory: ./capi
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil-c --release
+      env:
+        CARGO_PROFILE_RELEASE_PANIC: abort
 
   b3sum_tests:
     name: b3sum ${{ matrix.target.name }} ${{ matrix.channel }}
@@ -113,20 +134,18 @@ jobs:
         channel: ["stable", "nightly"]
 
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ format('{0}-{1}', matrix.channel, matrix.target.toolchain) }}
-    - uses: taiki-e/install-action@nextest
-    # Test b3sum.
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh ${{ matrix.channel }}
+    - run: sh tools/ci-tools.sh nextest
+    # Test b3sum (locked against b3sum/Cargo.lock, gated by dependency_policy).
     - name: test b3sum
-      run: cargo nextest run
+      run: cargo nextest run --locked
       working-directory: ./b3sum
     - name: test b3sum --no-default-features
-      run: cargo nextest run --no-default-features
+      run: cargo nextest run --locked --no-default-features
       working-directory: ./b3sum
     - name: Make sure enabling LTO via CFLAGS doesn't break the build.
-      run: cargo build
+      run: cargo build --locked
       env:
         CFLAGS: -flto
       working-directory: ./b3sum
@@ -144,58 +163,123 @@ jobs:
     env:
       CC: clang
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - uses: taiki-e/install-action@nextest
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-c@0.10.26
-    - run: cargo nextest run --lib --tests --features=serde
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh stable
+    - run: sh tools/ci-tools.sh nextest cargo-c
+    - run: sh tools/ci-locked.sh check -p blake3-servil-core --lib --no-default-features
+    - run: sh tools/ci-locked.sh nextest run -p blake3-servil-core --no-default-features
+    - run: sh tools/ci-locked.sh nextest run -p blake3-servil-core --lib --tests
     - name: threads
-      run: cargo nextest run --lib --tests --no-fail-fast
-      working-directory: ./threads
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil -P ci --lib --tests --no-fail-fast
+    # Assembly is built directly by rustc's LLVM assembler via global_asm! (#487),
+    # so every AArch64 build always includes both NEON and SME2 kernels and selects
+    # NEON vs SME2 at runtime on the CPU (exercised natively on this non-SME2 runner).
     # QEMU 11.1.2, Debian's static build, pinned by its SHA-256 and BLAKE3
     # hashes: the runner's own (Ubuntu's 8.2.2) crashed itself now and then
     # emulating a test's intended panic (#113).
     - name: QEMU 11.1.2
       run: |
-        curl -sSfLO http://deb.debian.org/debian/pool/main/q/qemu/qemu-user_11.1.2+ds-3_arm64.deb
+        curl -sSfLO --retry 3 https://snapshot.debian.org/archive/debian/20261115T000000Z/pool/main/q/qemu/qemu-user_11.1.2+ds-3_arm64.deb
         echo "e278d393447a97b548728918af8e395a33086f5b7100138e38cf06a41766612e  qemu-user_11.1.2+ds-3_arm64.deb" | sha256sum -c
         echo "7c3f49bb0945cf7e2148480118a34dc34ef1641cf5f83f0137996b78f2202945  qemu-user_11.1.2+ds-3_arm64.deb" > qemu.b3
-        cargo run -q --release --manifest-path b3sum/Cargo.toml -- -c qemu.b3
+        cargo run -q --release --locked --manifest-path b3sum/Cargo.toml -- -c qemu.b3
         ar x qemu-user_11.1.2+ds-3_arm64.deb data.tar.xz && tar xJf data.tar.xz ./usr/bin/qemu-aarch64
         sudo install usr/bin/qemu-aarch64 /usr/local/bin/qemu-aarch64 && qemu-aarch64 --version
-    - run: cargo nextest run --lib --tests --features=serde
+    - run: sh tools/ci-locked.sh nextest run -p blake3-servil-core --lib --tests
       env:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -cpu cortex-a72
         # tests/pool_fairness.rs measures the pool's shares by time, which an
         # emulator's scheduling decides: it skips (#213).
         BLAKE3_EMULATED: 1
     - name: threads, as a Cortex-A72
-      run: cargo nextest run --lib --tests
-      working-directory: ./threads
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil -P ci --lib --tests
       env:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -cpu cortex-a72
         BLAKE3_EMULATED: 1
     - name: C API
-      run: cargo nextest run --release
-      working-directory: ./capi
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil-c --release
+      env:
+        CARGO_PROFILE_RELEASE_PANIC: abort
+
+  aarch64_sme2_qemu:
+    # Exercise Linux AArch64 SME2 detection, startup self-test, assembly
+    # kernels (512-bit SVL), and thread-pool paths under QEMU user emulation
+    # on every PR (#412, #465). Correctness only (not timing).
+    name: "AArch64 Linux SME2 (QEMU 512-bit SVL)"
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CC: clang
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh stable
+    - run: sh tools/ci-tools.sh nextest
+    - name: QEMU 11.1.2
+      run: |
+        curl -sSfLO --retry 3 https://snapshot.debian.org/archive/debian/20261115T000000Z/pool/main/q/qemu/qemu-user_11.1.2+ds-3_arm64.deb
+        echo "e278d393447a97b548728918af8e395a33086f5b7100138e38cf06a41766612e  qemu-user_11.1.2+ds-3_arm64.deb" | sha256sum -c
+        echo "7c3f49bb0945cf7e2148480118a34dc34ef1641cf5f83f0137996b78f2202945  qemu-user_11.1.2+ds-3_arm64.deb" > qemu.b3
+        cargo run -q --release --locked --manifest-path b3sum/Cargo.toml -- -c qemu.b3
+        ar x qemu-user_11.1.2+ds-3_arm64.deb data.tar.xz && tar xJf data.tar.xz ./usr/bin/qemu-aarch64
+        sudo install usr/bin/qemu-aarch64 /usr/local/bin/qemu-aarch64 && qemu-aarch64 --version
+    - name: verify QEMU reports Linux SME2 (512-bit SVL)
+      run: |
+        cat <<'EOF' > /tmp/check_sme2.c
+        #include <stdio.h>
+        #include <sys/auxv.h>
+        int main(void) {
+            unsigned long h2 = getauxval(26);
+            if (!(h2 & (1UL << 37))) { fprintf(stderr, "missing HWCAP2_SME2 (0x%lx)\n", h2); return 1; }
+            unsigned long svl;
+            __asm__ volatile(".arch_extension sme\n rdsvl %0, #1" : "=r"(svl));
+            if (svl != 64) { fprintf(stderr, "unexpected SVL bytes: %lu\n", svl); return 2; }
+            printf("QEMU SME2 verified: HWCAP2=0x%lx SVL=%lu bytes\n", h2, svl);
+            return 0;
+        }
+        EOF
+        clang -O2 /tmp/check_sme2.c -o /tmp/check_sme2
+        qemu-aarch64 -cpu max,sme-default-vector-length=64 /tmp/check_sme2
+    - name: core, as Linux SME2 (512-bit SVL)
+      run: |
+        # Exclude ffi_output::tests::self_test_aborts_on_wrong_output from the
+        # outer runner only because its `Command::new(current_exe())` child runs
+        # natively on this arm64 host (without QEMU SME2); verify the SME2
+        # fail-stop child directly under QEMU SME2 right below.
+        sh tools/ci-locked.sh nextest run -p blake3-servil-core --lib --tests --no-fail-fast \
+          -E 'not test(ffi_output::tests::self_test_aborts_on_wrong_output)'
+        bin=$(sh tools/ci-locked.sh test -p blake3-servil-core --lib --no-run --message-format=json \
+          | python3 -c 'import json,sys; print([j["executable"] for line in sys.stdin if (j:=json.loads(line)).get("executable") and j.get("target",{}).get("kind")==["lib"]][-1])')
+        set +e
+        out=$(BLAKE3_SERVIL_TEST_ARM_OUTPUT_FAIL=sme2 qemu-aarch64 -cpu max,sme-default-vector-length=64 "$bin" --exact ffi_output::tests::self_test_aborts_on_wrong_output --nocapture 2>&1)
+        rc=$?
+        set -e
+        echo "$out"
+        test "$rc" -ne 0
+        echo "$out" | grep -q "SME2 keyed chunks"
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -cpu max,sme-default-vector-length=64
+        BLAKE3_EMULATED: 1
+    - name: threads, as Linux SME2 (512-bit SVL)
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil -P ci --lib --tests --no-fail-fast
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -cpu max,sme-default-vector-length=64
+        BLAKE3_EMULATED: 1
 
   capi_macos:
     name: "C API on macOS (installed consumers)"
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - uses: taiki-e/install-action@nextest
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-c@0.10.26
-    - run: brew install pkg-config
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh stable
+    - run: sh tools/ci-tools.sh nextest cargo-c
+    # no_std checks on Apple Silicon under -D warnings (without #[cfg(test)]).
+    - run: sh tools/ci-locked.sh check -p blake3-servil-core --lib --no-default-features
     # The same installed-consumer test as on Linux: shared and static
     # installations, pkg-config flags, C11 and C++11 callers.
     - name: C API
-      run: cargo nextest run --release --manifest-path capi/Cargo.toml
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil-c --release
+      env:
+        CARGO_PROFILE_RELEASE_PANIC: abort
 
   # The oldest GCC supported (CONTRIBUTING.md): Debian 12's, the oldest in a
   # supported distribution (Debian 11's support ended in August 2026). Older compilers are unsupported (GCC 5.4's
@@ -208,19 +292,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-    - uses: addnab/docker-run-action@v3
-      with:
-        image: gcc:12
-        options: -v ${{ github.workspace }}:/work
-        run: |
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: |
+        docker run --rm -e BLAKE3_CI -e RUSTFLAGS -e RUST_BACKTRACE -v "$PWD":/work -w /work \
+          gcc:12@sha256:3d3af69c72edf0652bb3a829965142e81891899c7827d849bc3c0dbb9edd216a sh -euc '
           cat /proc/cpuinfo
-          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
-          cd /work
-          ~/.cargo/bin/cargo nextest run
-          ~/.cargo/bin/cargo test --doc
-          cd threads && ~/.cargo/bin/cargo nextest run --no-fail-fast
+          curl --proto "=https" --tlsv1.2 -sSfL -o /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init
+          echo "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init" | sha256sum -c
+          chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain "$(sed -n "s/^rustc //p" /work/tools/b3sum-release.toolchain)" && rm /tmp/rustup-init
+          sh tools/ci-tools.sh nextest
+          export CARGO=~/.cargo/bin/cargo
+          sh tools/ci-locked.sh nextest run -p blake3-servil-core
+          sh tools/ci-locked.sh test --doc -p blake3-servil-core
+          sh tools/ci-locked.sh nextest run -p blake3-servil -P ci --no-fail-fast'
 
   # x86-64's three kernel widths, whichever CPU this runner is: the suites
   # as an AVX-512 CPU (Ice Lake server), as one with AVX2 and no AVX-512
@@ -242,14 +326,19 @@ jobs:
       fail-fast: false
       matrix:
         cpu: [
-          { "flag": "icx", "name": "an Ice Lake server CPU: AVX-512" },
-          { "flag": "hsw", "name": "a Haswell: AVX2, no AVX-512" },
-          { "flag": "nhm", "name": "a Nehalem: SSE4.1, no AVX2" },
+          # Split Ice Lake AVX-512 core & threads into parallel jobs: running
+          # both serially took 15.0 min (477s + 381s), 2.35x slower than every
+          # other CI job. Parallelizing cuts CI critical path to ~6.5 min with
+          # identical instruction-set coverage.
+          { "flag": "icx", "suite": "core", "name": "an Ice Lake server CPU: AVX-512 core" },
+          { "flag": "icx", "suite": "threads", "name": "an Ice Lake server CPU: AVX-512 threads" },
+          { "flag": "hsw", "suite": "both", "name": "a Haswell: AVX2, no AVX-512" },
+          { "flag": "nhm", "suite": "both", "name": "a Nehalem: SSE4.1, no AVX2" },
         ]
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-    - uses: taiki-e/install-action@nextest
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh stable
+    - run: sh tools/ci-tools.sh nextest
     # What this runner is, beside what it is about to run as.
     - run: grep -o -w 'avx512f\|avx512vl\|avx2\|sse4_1' /proc/cpuinfo | sort -u
     - name: Intel SDE 9.58.0
@@ -257,11 +346,12 @@ jobs:
         curl -sSfL -o sde.tar.xz https://downloadmirror.intel.com/859732/sde-external-9.58.0-2025-06-16-lin.tar.xz
         echo "f849acecad4c9b108259c643b2688fd65c35723cd23368abe5dd64b917cc18c0  sde.tar.xz" | sha256sum -c
         echo "22b6383cfadc97177e0bf3e432ca339a734222b53fb8c00d4a6e51797d96f27f  sde.tar.xz" > sde.b3
-        cargo run -q --release --manifest-path b3sum/Cargo.toml -- -c sde.b3
+        cargo run -q --release --locked --manifest-path b3sum/Cargo.toml -- -c sde.b3
         mkdir "$RUNNER_TEMP/sde" && tar xJf sde.tar.xz -C "$RUNNER_TEMP/sde" --strip-components=1
         rm sde.tar.xz sde.b3
         "$RUNNER_TEMP/sde/sde64" -version | head -n 1
-    - run: cargo nextest run --release --lib --tests --no-run
+    - if: matrix.cpu.suite != 'threads'
+      run: sh tools/ci-locked.sh nextest run -p blake3-servil-core --release --lib --tests --no-run
     # The `emulated` profile's clock (.config/nextest.toml): a test runs
     # tens of times slower here than on the CPU.
     # The emulator stops a test at the first instruction the CPU it plays
@@ -269,22 +359,51 @@ jobs:
     # and its kernels, and not the system's libraries: as a Nehalem, the
     # runner's dynamic loader (chosen for the real CPU) ran an AVX
     # instruction before any test did.
-    - run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$RUNNER_TEMP/sde/sde64 -${{ matrix.cpu.flag }} -chip_check_exe_only -- " cargo nextest run -P emulated --release --lib --tests
+    - if: matrix.cpu.suite != 'threads'
+      run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$RUNNER_TEMP/sde/sde64 -${{ matrix.cpu.flag }} -chip_check_exe_only -- " sh tools/ci-locked.sh nextest run -p blake3-servil-core -P emulated --release --lib --tests
     - name: threads, emulated
-      working-directory: ./threads
-      run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$RUNNER_TEMP/sde/sde64 -${{ matrix.cpu.flag }} -chip_check_exe_only -- " cargo nextest run -P emulated --release --lib --tests
+      if: matrix.cpu.suite != 'core'
+      run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$RUNNER_TEMP/sde/sde64 -${{ matrix.cpu.flag }} -chip_check_exe_only -- " sh tools/ci-locked.sh nextest run -p blake3-servil -P emulated --release --lib --tests
 
   x86_model:
     name: "the x86-64 proofs' model against the CPU"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     # GitHub's runners vary: the AVX-512 forms are checked on those that
     # have AVX-512, and this line says which this one is.
     - run: grep -o -w 'avx512f\|avx512vl\|avx2\|sse4_1' /proc/cpuinfo | sort -u
-    - run: sudo apt-get install -y llvm lld clang && pip install z3-solver
-    - run: python3 tools/verify/cross_check_x86.py
+    # In the container releases are built in, with LLVM 18 from the day of
+    # Ubuntu's archive the toolchain file names (GitHub's image has no
+    # llvm-objdump): what the check installs is the same on every run.
+    # ca-certificates comes first, from the archive of the day, as in
+    # tools/b3sum-release-container.sh: the snapshot is served over HTTPS.
+    - run: |
+        printf '%s\n' \
+          'z3-solver==5.4.1.0 \' \
+          '  --hash=sha256:e680ce083683abca5d07c3e55c2f620ff9a29cb91c548eeeea27ae29e8060522 \' \
+          '  --hash=sha256:f2c745d1623128400c208d875fba741ccd88f061cb89b5661a9f2169eb24b110' \
+          > /tmp/z3.req
+        docker run --rm -v "$PWD":/src -v /tmp/z3.req:/tmp/z3.req:ro -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh -euc '
+          snapshot=$(sed -n "s/^apt-snapshot //p" tools/b3sum-release.toolchain)
+          export DEBIAN_FRONTEND=noninteractive
+          apt="apt-get -q -o Acquire::Retries=5 -o Acquire::http::Timeout=30"
+          retry() {
+            n=1
+            while true; do
+              "$@" && return 0
+              [ "$n" -ge 4 ] && return 1
+              n=$((n + 1))
+              sleep 10
+            done
+          }
+          retry $apt update
+          retry $apt install -y --no-install-recommends ca-certificates
+          retry $apt update --snapshot "$snapshot"
+          retry $apt install -y --no-install-recommends --snapshot "$snapshot" python3 python3-pip gcc libc6-dev llvm-18 lld-18 clang-18
+          pip install --break-system-packages --require-hashes -r /tmp/z3.req
+          python3 tools/verify/cross_check_x86.py'
 
   b3sum_release_build:
     # b3sum's release binary, built as a release builds it
@@ -299,12 +418,68 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         # The commit and its parent: a version commit names its parent.
         fetch-depth: 2
-    - run: docker run --rm -e B3SUM_RELEASE_ANY_COMMIT=1 -v "$PWD":/src -w /src ubuntu:26.04 sh tools/b3sum-release-container.sh
-    - uses: actions/upload-artifact@v4
+    - run: docker run --rm -e B3SUM_RELEASE_ANY_COMMIT=1 -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: b3sum-${{ runner.arch }}
         path: dist/
+
+  python_tools:
+    name: python tools (${{ matrix.os }}, ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # The system's CPython, and PyPy: it has no reference counts, so a file
+        # left unclosed stays unwritten, and it lacks some of CPython's os calls.
+        python: [python3, pypy3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - run: sh tools/ci-rust.sh stable
+    - name: PyPy 8.0.1 (Python 3.12), by the SHA-256 pypy.org publishes
+      if: matrix.python == 'pypy3'
+      run: |
+        case "$(uname -sm)" in
+          "Linux x86_64") name=pypy3.12-v8.0.1-linux64 sha=aeed27797777296d9c94e53bdfa608804696dbd4ff9f2213003cce064ee46ef8 ;;
+          "Darwin arm64") name=pypy3.12-v8.0.1-macos_arm64 sha=c10baeae4a61063a1183c4ee4e8324765ba736a3980323654efb31e79f1514db ;;
+          *) echo "no PyPy named for $(uname -sm)"; exit 1 ;;
+        esac
+        curl -sSfL -o "$RUNNER_TEMP/pypy.tar.gz" "https://downloads.python.org/pypy/$name.tar.gz"
+        echo "$sha  $RUNNER_TEMP/pypy.tar.gz" | shasum -a 256 -c
+        tar -xzf "$RUNNER_TEMP/pypy.tar.gz" -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/$name/bin" >> "$GITHUB_PATH"
+    - name: z3-solver 5.4.1.0 wheel, by SHA-256 (unpacked directly, no pip)
+      run: |
+        case "$(uname -sm)" in
+          "Linux x86_64")
+            # BLAKE3: 17da9aa2b71726d8805fe4dba2c98d74a7e8f61d3db7b7bf829dd7f6a8f6acde
+            url="https://files.pythonhosted.org/packages/04/bd/0f7c575074092d7606751245a1e3577cf5ab922c2a59389f39c4f037c749/z3_solver-5.4.1.0-py3-none-manylinux_2_27_x86_64.whl"
+            sha="e680ce083683abca5d07c3e55c2f620ff9a29cb91c548eeeea27ae29e8060522"
+            ;;
+          "Darwin arm64")
+            # BLAKE3: fd5f797bcd67c690b7e3a5553c4c1d3bb4204fafa6d08459d4a13885c5263b94
+            url="https://files.pythonhosted.org/packages/9f/08/914c3cc898098af6b2d4af02e6b332c71c495be21d0519f57d15b142ad01/z3_solver-5.4.1.0-py3-none-macosx_13_0_arm64.whl"
+            sha="9518a4cb03f49a38d4b1895b80910a12e0b0d144300472b95562426657396e01"
+            ;;
+          *) echo "no z3-solver wheel named for $(uname -sm)"; exit 1 ;;
+        esac
+        curl -sSfL -o "$RUNNER_TEMP/z3.whl" "$url"
+        echo "$sha  $RUNNER_TEMP/z3.whl" | shasum -a 256 -c
+        ${{ matrix.python }} -m zipfile -e "$RUNNER_TEMP/z3.whl" "$RUNNER_TEMP/z3"
+    - name: Python tool test suites and unsafe-reasons check
+      run: |
+        set -eu
+        ${{ matrix.python }} --version
+        for d in tools tools/runner tools/mutants tools/tests; do
+          echo "=== $d ==="
+          ${{ matrix.python }} -W default -m unittest discover -s "$d" -t "$d" -p 'test_*.py' -v
+        done
+        echo "=== tools/verify ==="
+        PYTHONPATH="$RUNNER_TEMP/z3" ${{ matrix.python }} -W default -m unittest discover -s tools/verify -t tools/verify -p 'test_*.py' -v
+        ${{ matrix.python }} -W default tools/unsafe_reasons.py

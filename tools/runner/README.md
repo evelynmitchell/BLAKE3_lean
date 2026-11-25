@@ -59,7 +59,9 @@ pulls before each look; results land in `results/` with the machine's
 name in the folder. A job runs once per file name, so a changed job takes
 a new number. The job format is the docstring at the top of `runner.py`.
 A machine that serves the shared exchange runs nothing else, so a
-timing job there needs no arrangement with anyone.
+timing job there needs no arrangement with anyone. A job that ran into
+its time limit has `stacks.txt` among its results: its processes, and
+what each was doing when the limit came.
 
 ## A machine for the shared exchange (once)
 
@@ -106,6 +108,9 @@ becomes a tag of the same name once its finding is written down.
 Every job type runs on the Mac. A thorough `--all` benchmark run under the
 runner matches the same run from the user's Terminal (704 cells, median
 ratio 1.001).
+
+The runner's own tests (`python3 -m unittest discover -s tools/runner`)
+run in CI on Linux and macOS, under the system's CPython and under PyPy.
 
 ## The chip's power (`"powermetrics": true`)
 

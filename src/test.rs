@@ -1,7 +1,6 @@
 use crate::{BLOCK_LEN, CHUNK_LEN, CVBytes};
 
 include!("../tools/require_nextest.rs");
-use arrayvec::ArrayVec;
 
 pub(crate) use crate::test_support::*;
 
@@ -155,9 +154,9 @@ fn test_whole_chunks_round_up_to_the_lanes() {
     use crate::{CHUNK_LEN, Ran};
     // The startup self-test first: it runs inside a process's first call,
     // on the calling thread, and its own cases round up (to 4 lanes on
-    // AVX2, to 4 and 8 on AVX-512), which the counts below would take for
-    // the message's. The 2-chunk message is asked first, so a self-test
-    // counted again fails here on every machine.
+    // AVX2, to 8 lanes via `ffi_partial::self_test` on AVX-512), which the
+    // counts below would take for the message's. The 2-chunk message is
+    // asked first, so a self-test counted again fails here on every machine.
     crate::initialize();
     let input = std::vec![0x5au8; 8 * CHUNK_LEN];
     let ran = |len: usize| {
@@ -176,19 +175,9 @@ fn test_whole_chunks_round_up_to_the_lanes() {
         assert_eq!(ran(7 * CHUNK_LEN), (true, 8 | 4), "7 whole chunks on AVX2: 8 lanes, one pass; their 3 parents on 4");
         assert_eq!(ran(5 * CHUNK_LEN), (true, 8), "5 whole chunks on AVX2: 8 lanes, one pass");
     }
-    // 3 chunks and a partial: on SSE4.1 and AVX2 the partial chunk takes
-    // the spare lane and nothing rounds. AVX-512 has no spare-lane pass at
-    // this count (spare_lane), so its 3 whole chunks round up to 4 lanes
-    // and the partial chunk follows alone.
-    #[cfg(blake3_avx512_ffi)]
-    let avx512 = crate::platform::Platform::avx512().is_some();
-    #[cfg(not(blake3_avx512_ffi))]
-    let avx512 = false;
-    assert_eq!(
-        ran(3 * CHUNK_LEN + 500),
-        if avx512 { (true, 4) } else { (false, 0) },
-        "3 whole and a partial: the spare lane's pass, or on AVX-512 the rounding"
-    );
+    // 3 chunks and a partial: on SSE4.1, AVX2, and AVX-512 the partial chunk
+    // takes the spare lane and nothing rounds.
+    assert_eq!(ran(3 * CHUNK_LEN + 500), (false, 0), "3 whole and a partial: the spare lane's pass, never rounding");
     // AVX-512: 9 to 15 on 16 lanes; past 16, the whole group of 16 and the
     // rest rounded (19 = 16 + 3 on 4), or 32 lanes where that kernel runs.
     #[cfg(blake3_avx512_ffi)]
@@ -252,6 +241,31 @@ fn test_counts_past_the_widest_kernel_split_into_groups_and_a_rounded_rest() {
     assert_eq!(crate::ROUNDED_WIDTH.with(|w| w.get()), 4);
 }
 
+#[test]
+fn test_hash_std_hash_distinguishes_values() {
+    use core::hash::{Hash as CoreHash, Hasher as CoreHasher};
+    struct Fold(u64);
+    impl CoreHasher for Fold {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = self.0.wrapping_mul(0x100000001b3) ^ u64::from(b);
+            }
+        }
+    }
+    let code = |h: &crate::Hash| {
+        let mut f = Fold(0xcbf29ce484222325);
+        h.hash(&mut f);
+        f.finish()
+    };
+    let a = crate::Hash::from_bytes([1u8; 32]);
+    let b = crate::Hash::from_bytes([2u8; 32]);
+    assert_eq!(code(&a), code(&crate::Hash::from_bytes([1u8; 32])));
+    assert_ne!(code(&a), code(&b), "core::hash::Hash for Hash must feed digest bytes");
+}
+
 /// The decisions between equally correct paths, exactly as their rules
 /// say (BLAKE3 #219: a mutant that moves one takes the other path, whose
 /// digest is the same, so only the decision itself can catch it). The
@@ -261,28 +275,82 @@ fn test_counts_past_the_widest_kernel_split_into_groups_and_a_rounded_rest() {
 fn test_the_paths_chosen_exactly() {
     use crate::platform::Platform;
     // spare_lane(platform, whole chunks, partial bytes): the lane for the
-    // partial chunk. AVX2: one whole chunk with a partial past a block,
-    // four lanes; three whole, four (SSE4.1 too); six or seven, eight;
-    // five with a partial past five blocks, eight; else none.
-    assert_eq!(crate::spare_lane(Platform::AVX2, 1, BLOCK_LEN + 1), Some(4));
-    assert_eq!(crate::spare_lane(Platform::AVX2, 1, BLOCK_LEN), None);
-    assert_eq!(crate::spare_lane(Platform::AVX2, 1, 0), None);
-    assert_eq!(crate::spare_lane(Platform::AVX2, 3, 0), Some(4));
-    assert_eq!(crate::spare_lane(Platform::SSE41, 3, 500), Some(4));
-    assert_eq!(crate::spare_lane(Platform::SSE41, 1, 500), None);
-    assert_eq!(crate::spare_lane(Platform::AVX2, 6, 0), Some(8));
-    assert_eq!(crate::spare_lane(Platform::AVX2, 7, 1000), Some(8));
-    assert_eq!(crate::spare_lane(Platform::AVX2, 5, 5 * BLOCK_LEN + 1), Some(8));
-    assert_eq!(crate::spare_lane(Platform::AVX2, 5, 5 * BLOCK_LEN), None);
-    assert_eq!(crate::spare_lane(Platform::AVX2, 5, 0), None);
+    // partial chunk. Three whole chunks in four lanes (SSE4.1 and AVX2);
+    // six or seven, or five with a partial past five blocks, in eight
+    // (AVX2); else none (one whole chunk is handled earlier by `pair`).
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 1, BLOCK_LEN + 1), None);
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 1, BLOCK_LEN), None);
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 1, 0), None);
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 3, 0), Some(4));
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::SSE41, 3, 500), Some(4));
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::SSE41, 1, 500), None);
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 6, 0), Some(8));
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 7, 1000), Some(8));
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 5, 5 * BLOCK_LEN + 1), Some(8));
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 5, 5 * BLOCK_LEN), None);
+    assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, 5, 0), None);
     for whole in [0, 2, 4, 8] {
-        assert_eq!(crate::spare_lane(Platform::AVX2, whole, 1000), None, "{whole} whole chunks");
+        assert_eq!(crate::ffi_partial::spare_lane(Platform::AVX2, whole, 1000), None, "{whole} whole chunks");
     }
     #[cfg(blake3_avx512_ffi)]
     {
-        assert_eq!(crate::spare_lane(Platform::AVX512, 1, BLOCK_LEN + 1), Some(4));
-        assert_eq!(crate::spare_lane(Platform::AVX512, 1, BLOCK_LEN), None);
-        assert_eq!(crate::spare_lane(Platform::AVX512, 3, 0), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 1, BLOCK_LEN + 1), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 1, BLOCK_LEN + 1), None);
+        // 2 whole chunks -> 4-lane horizontal zmm (> 4 blocks so cold-cache 2304 B stays fast).
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 2, 4 * BLOCK_LEN), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 2, 4 * BLOCK_LEN + 1), Some(4));
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 2, 4 * BLOCK_LEN), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 2, 4 * BLOCK_LEN + 1), Some(4));
+        // 3 whole chunks -> 4-lane horizontal zmm (all partials on wide Zen 5; > 1 block on Ice Lake).
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 3, 1), Some(4));
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 3, BLOCK_LEN), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 3, BLOCK_LEN + 1), Some(4));
+        // 4 whole chunks -> 8-lane ymm (> 13 blocks so cold-cache 4470 B stays fast).
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 4, 13 * BLOCK_LEN), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 4, 13 * BLOCK_LEN + 1), Some(8));
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 4, 13 * BLOCK_LEN), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 4, 13 * BLOCK_LEN + 1), Some(8));
+        // 5..=7 whole chunks -> 8-lane ymm unconditionally.
+        for whole in 5..=7 {
+            assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, whole, 1), Some(8));
+            assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, whole, 1), Some(8));
+        }
+        // 8 whole chunks -> 16-lane zmm (> 2 blocks on wide Zen 5 only).
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, 8, 1023), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 8, 2 * BLOCK_LEN), None);
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 8, 2 * BLOCK_LEN + 1), Some(16));
+        // 9..=15 whole chunks -> 16-lane zmm (all partials on wide Zen 5; > 9 blocks on Ice Lake).
+        for whole in [9, 12, 15] {
+            assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, whole, 1), Some(16));
+            assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, whole, 9 * BLOCK_LEN), None);
+            assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, false, whole, 9 * BLOCK_LEN + 1), Some(16));
+        }
+        assert_eq!(crate::ffi_partial::spare_lane_for(Platform::AVX512, true, 16, 1000), None);
+    }
+    // Verify `compress_chunks_parallel` dispatches `(Platform::SSE41, 4)` to
+    // the 4-lane SSE4.1 partial kernel rather than falling through to 8-lane
+    // AVX2 (tested directly so AVX-512 hosts exercise the SSE4.1 arm too).
+    #[cfg(feature = "std")]
+    if crate::platform::sse41_detected() {
+        let input = std::vec![0x3du8; 3 * CHUNK_LEN + 500];
+        let mut out = [0u8; 4 * crate::OUT_LEN];
+        crate::RAN_ENTRIES.with(|r| r.borrow_mut().clear());
+        let n = crate::compress_chunks_parallel(&input, crate::IV, 0, 0, Platform::SSE41, &mut out);
+        assert_eq!(n, 4);
+        let sse41_entry = crate::ffi_partial::entry_sse41() as usize;
+        assert!(crate::RAN_ENTRIES.with(|r| r.borrow().contains(&sse41_entry)), "SSE4.1 3+partial must run partial_sse41");
+    }
+    #[cfg(all(feature = "std", blake3_avx512_ffi))]
+    if crate::platform::avx512_detected() {
+        let entries: std::vec::Vec<usize> = crate::ffi_partial::entries_avx512().iter().map(|&(_, p)| p as usize).collect();
+        for (len, expect_partial) in [(2304usize, false), (2305, true), (4470, false), (4929, true)] {
+            let input = std::vec![0x5au8; len];
+            let mut out = [0u8; 8 * crate::OUT_LEN];
+            crate::RAN_ENTRIES.with(|r| r.borrow_mut().clear());
+            let _ = crate::compress_chunks_parallel(&input, crate::IV, 0, 0, Platform::AVX512, &mut out);
+            let hit = crate::RAN_ENTRIES.with(|r| r.borrow().iter().any(|e| entries.contains(e)));
+            assert_eq!(hit, expect_partial, "AVX-512 partial dispatch mismatch for {len} B");
+        }
     }
     // rounded_lanes(platform, whole inputs): the width that takes the count
     // in one pass where the kernels' cascade would take two or three. 3
@@ -572,7 +640,8 @@ fn test_xof_partial_block_cache_seeks_and_clones() {
         let key = [0x42u8; 32];
         for mode in [crate::Mode::Plain, crate::Mode::Keyed(&key), crate::Mode::DeriveKey("partial XOF block cache")] {
             let mut hasher = crate::Hasher::new(mode, None);
-            hasher.core.chunk_state.platform = platform;
+            hasher.set_platform_for_test(platform);
+            assert_eq!(hasher.platform(), platform);
             hasher.update(b"the cached output belongs to its counter and mode");
             let expected = official::xof(mode, b"the cached output belongs to its counter and mode", 0, 256);
             let mut reader = hasher.finalize_xof();
@@ -911,7 +980,7 @@ fn test_block_buffer_alignment() {
     assert_eq!(64, core::mem::align_of::<crate::Output>());
     assert_eq!(0, core::mem::offset_of!(crate::Output, block));
     assert_eq!(64, core::mem::align_of::<crate::ChunkState>());
-    assert_eq!(0, core::mem::offset_of!(crate::ChunkState, buf));
+    // ChunkState.buf offset == 0 is asserted at compile time in src/hasher.rs.
 }
 
 #[test]
@@ -987,48 +1056,6 @@ fn test_update_reader_interrupted() -> std::io::Result<()> {
     hasher.update_reader(&mut reader)?;
     assert_eq!(hasher.finalize(), crate::convenience::hash(input));
     Ok(())
-}
-
-/// Hash's wire format: an array of 32 bytes in JSON and CBOR, and a CBOR
-/// bytestring still read. The format comes from a derive no mutant touches,
-/// so this test is its one check.
-#[test]
-#[cfg(feature = "std")]
-#[cfg(feature = "serde")]
-fn test_serde() {
-    // Henrik suggested that we use 0xfe / 254 for byte test data instead of 0xff / 255, due to the
-    // fact that 0xfe is not a well formed CBOR item.
-    let hash: crate::Hash = [0xfe; 32].into();
-
-    let json = serde_json::to_string(&hash).unwrap();
-    assert_eq!(json, "[254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254]",);
-    let hash2: crate::Hash = serde_json::from_str(&json).unwrap();
-    assert_eq!(hash, hash2);
-
-    let mut cbor = Vec::<u8>::new();
-    ciborium::into_writer(&hash, &mut cbor).unwrap();
-    assert_eq!(
-        cbor,
-        [
-            0x98, 0x20, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe,
-            0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe,
-            0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe, 0x18, 0xfe,
-        ]
-    );
-    let hash_from_cbor: crate::Hash = ciborium::from_reader(&cbor[..]).unwrap();
-    assert_eq!(hash_from_cbor, hash);
-
-    // Version 1.5.2 of this crate changed the default serialization format to a bytestring
-    // (instead of an array/list) to save bytes on the wire. That was a backwards compatibility
-    // mistake for non-self-describing formats, and it's been reverted. Since some small number of
-    // serialized bytestrings will probably exist forever in the wild, we should test that we can
-    // still deserialize these from self-describing formats.
-    let bytestring_cbor: &[u8] = &[
-        0x58, 0x20, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
-        0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe,
-    ];
-    let hash_from_bytestring_cbor: crate::Hash = ciborium::from_reader(bytestring_cbor).unwrap();
-    assert_eq!(hash_from_bytestring_cbor, hash);
 }
 
 // BLAKE3-Servil's unsafe paths on small inputs: the batch tables and padded
@@ -1499,16 +1526,6 @@ fn test_hasher_gathers() {
         }
         assert_eq!(hasher.finalize(), crate::convenience::hash(&input), "pieces from {start}");
     }
-    // A subtree of 64 chunks at offset 64 KiB, in small pieces, against one update.
-    let sub = &input[..64 * CHUNK_LEN];
-    let mut whole = crate::Hasher::new(crate::Mode::Plain, None);
-    whole.set_input_offset(64 * CHUNK_LEN as u64).update(sub);
-    let mut pieced = crate::Hasher::new(crate::Mode::Plain, None);
-    pieced.set_input_offset(64 * CHUNK_LEN as u64);
-    for piece in sub.chunks(1448) {
-        pieced.update(piece);
-    }
-    assert_eq!(pieced.finalize_non_root(), whole.finalize_non_root());
 }
 
 /// Hash's comparisons (constant time) and formats: equal and unequal
@@ -1528,6 +1545,150 @@ fn test_hash_comparisons_and_formats() {
         assert_eq!(std::format!("{a}"), hex.as_str());
         assert_eq!(std::format!("{a:?}"), std::format!("Hash({:?})", hex.as_str()));
     }
+}
+
+/// Every byte of a Hash counts in each of its comparisons: two that differ
+/// in one byte, at any of the 32 offsets, are unequal, against a Hash, a
+/// 32-byte array and a slice; so is a slice a byte shorter or longer. (A
+/// comparison that stopped one byte early passed every other test here:
+/// BLAKE3 PR #484.)
+#[test]
+fn test_every_byte_of_a_hash_counts_in_its_comparisons() {
+    let bytes: [u8; 32] = core::array::from_fn(|i| i as u8 * 7 + 1);
+    let hash = crate::Hash::from_bytes(bytes);
+    assert!(hash == crate::Hash::from_bytes(bytes) && hash == bytes && hash == bytes[..]);
+    for at in 0..32 {
+        for flip in [0x01u8, 0x80, 0xff] {
+            let mut other = bytes;
+            other[at] ^= flip;
+            assert!(hash != crate::Hash::from_bytes(other), "byte {at} ^ {flip:#04x}, against a Hash");
+            assert!(hash != other, "byte {at} ^ {flip:#04x}, against an array");
+            assert!(hash != other[..], "byte {at} ^ {flip:#04x}, against a slice");
+        }
+    }
+    let mut longer = [0u8; 33];
+    longer[..32].copy_from_slice(&bytes);
+    assert!(hash != bytes[..31] && hash != longer[..] && hash != [0u8; 0][..]);
+}
+
+/// A StackVec holds what was put in, in order, by each of its ways in, up
+/// to its capacity, and one element more panics by each of them.
+#[test]
+fn test_stack_vec_holds_its_elements_and_refuses_one_too_many() {
+    use crate::stack_vec::StackVec;
+    let mut v = StackVec::<u32, 5>::new();
+    assert!(v.is_empty());
+    v.push(7);
+    v.extend([8, 9]);
+    assert_eq!(*v, [7, 8, 9]);
+    v.extend_from_slice(&[10, 11]);
+    assert_eq!(v.as_slice(), &[7, 8, 9, 10, 11]);
+    v.as_mut_slice()[0] = 1;
+    v[4] = 5;
+    let mut by_reference = [0; 5];
+    for (slot, &element) in by_reference.iter_mut().zip(&v) {
+        *slot = element;
+    }
+    assert_eq!(by_reference, [1, 8, 9, 10, 5]);
+    let collected: StackVec<u8, 3> = (1..=3).collect();
+    assert_eq!(*collected, [1, 2, 3]);
+    let nothing: StackVec<u8, 0> = Default::default();
+    assert!(nothing.is_empty() && StackVec::<u8, 3>::default().is_empty());
+    #[cfg(feature = "std")]
+    {
+        let mut two = StackVec::<u8, 3>::new();
+        two.extend([1, 2]);
+        assert!(collected.is_full() && !two.is_full() && StackVec::<u8, 0>::new().is_full());
+        two.clear();
+        assert!(two.is_empty() && !two.is_full());
+        two.push(4);
+        assert_eq!(*two, [4]);
+        // One element too many, by each way in; the last, a slice of two
+        // into room for one.
+        for way in 0..4 {
+            let overflow = std::panic::catch_unwind(|| {
+                let mut full: StackVec<u8, 3> = (1..=3).collect();
+                match way {
+                    0 => full.push(4),
+                    1 => full.extend([4]),
+                    2 => full.extend_from_slice(&[4]),
+                    _ => {
+                        let mut room_for_one = StackVec::<u8, 3>::new();
+                        room_for_one.extend([1, 2]);
+                        room_for_one.extend_from_slice(&[3, 4]);
+                    }
+                }
+            });
+            assert!(overflow.is_err(), "way {way}");
+        }
+        let too_many = std::panic::catch_unwind(|| (1..=4).collect::<StackVec<u8, 3>>().len());
+        assert!(too_many.is_err());
+        // A fill that panics midway leaves the vector as it was, and usable:
+        // by an iterator that gives two elements and then panics, and by one
+        // that gives more than fit.
+        let mut kept: StackVec<u8, 4> = StackVec::new();
+        kept.push(1);
+        for too_long in [false, true] {
+            let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                kept.extend((2u8..).map(|n| if n < 4 || too_long { n } else { panic!("the iterator fails") }));
+            }));
+            assert!(filled.is_err(), "too long: {too_long}");
+            assert_eq!(*kept, [1], "too long: {too_long}");
+        }
+        kept.extend([5, 6]);
+        assert_eq!(*kept, [1, 5, 6]);
+    }
+}
+
+/// A HexHash keeps the contracts of the str it lends (Borrow<str> asks for
+/// the str's own hash, equality and order): a map keyed by HexHash finds
+/// a key by its &str, and Display honors width and precision as a str's
+/// does. (BLAKE3 PR #484: a hash derived over the byte array missed the
+/// lookup, and a Display that wrote the 64 characters ignored `{:.8}`.)
+#[test]
+#[cfg(feature = "std")]
+fn test_hex_hash_keeps_the_contracts_of_its_str() {
+    use std::hash::BuildHasher;
+    let a = crate::Hash::from_bytes([0xab; 32]).to_hex();
+    let b = crate::Hash::from_bytes(core::array::from_fn(|i| i as u8)).to_hex();
+    let state = std::collections::hash_map::RandomState::new();
+    assert_eq!(state.hash_one(a), state.hash_one(a.as_str()));
+    assert_eq!(state.hash_one(b), state.hash_one(b.as_str()));
+    let mut map = std::collections::HashMap::new();
+    map.insert(a, 1);
+    map.insert(b, 2);
+    assert_eq!((map.get(a.as_str()), map.get(b.as_str()), map.get("another key")), (Some(&1), Some(&2), None));
+    let mut tree = std::collections::BTreeMap::new();
+    tree.insert(a, 1);
+    tree.insert(b, 2);
+    assert_eq!((tree.get(a.as_str()), tree.get(b.as_str()), tree.get("another key")), (Some(&1), Some(&2), None));
+    assert_eq!((a.cmp(&b), b.cmp(&a), a.cmp(&a)), (a.as_str().cmp(b.as_str()), b.as_str().cmp(a.as_str()), core::cmp::Ordering::Equal));
+    assert!(a == *a.as_str() && a == a.as_str() && a != *b.as_str() && a != b.as_str() && a == a && a != b);
+
+    assert_eq!(std::format!("{a}"), a.as_str());
+    assert_eq!(std::format!("{a:.8}"), "abababab");
+    assert_eq!(std::format!("{a:>70}"), std::format!("      {}", a.as_str()));
+    assert_eq!(std::format!("{a:-<12.4}"), "abab--------");
+    assert_eq!(std::format!("{a:?}"), std::format!("{:?}", a.as_str()));
+}
+
+/// Every view of a HexHash gives its 64 characters: the str and the bytes
+/// through AsRef, the str through Deref, and from_hex reads it back to the
+/// hash. (The review of BLAKE3 PR #484, and the Mac's mutants: views that
+/// gave an empty or another string passed every test.)
+#[test]
+fn test_every_view_of_a_hex_hash_is_its_characters() {
+    let hash = crate::Hash::from_bytes(core::array::from_fn(|i| (i * 7 + 3) as u8));
+    let hex = hash.to_hex();
+    let as_str: &str = hex.as_ref();
+    let as_bytes: &[u8] = hex.as_ref();
+    let deref: &str = &hex;
+    assert_eq!(hex.as_str().len(), 64);
+    assert_eq!(&hex.as_str()[..8], "030a1118");
+    assert_eq!((as_str, deref, as_bytes), (hex.as_str(), hex.as_str(), hex.as_str().as_bytes()));
+    assert_eq!(hex.len(), 64); // a str's method, reached through Deref
+    assert_eq!(crate::Hash::from_hex(hex).unwrap(), hash);
+    assert_eq!(crate::Hash::from_hex(hex.as_str()).unwrap(), hash);
 }
 
 /// A Hasher's Debug form names its flags and platform, and leaves out
@@ -1784,7 +1945,7 @@ mod dispatch {
             (64, 2, &["p2"]),
             (64, 4, &["p4"]),
             (64, 9, &["p9"]),
-            (64, 10, &["p3", "p7"]),
+            (64, 10, &["p10"]),
             (64, 11, &["hash16_messages"]),
             (64, 16, &["hash16_parents"]),
             (64, 17, &["hash16_parents", "k1", "p1"]),
@@ -1804,79 +1965,17 @@ mod dispatch {
 }
 
 /// Subtrees hashed apart and merged, the independent computation the
-/// pool's and the Hasher's tests check themselves against: a Hasher
-/// positioned at a subtree's offset, its chaining value, and the parent of
-/// two chaining values (`hasher::parent_output` under a mode).
-pub(crate) trait SubtreeHasher {
-    /// Position the hasher at `offset` bytes into the whole input, before
-    /// any input (a subtree's offset bounds its length: `max_subtree_len`).
-    fn set_input_offset(&mut self, offset: u64) -> &mut Self;
-    /// The chaining value of the chunk or subtree hashed so far.
-    fn finalize_non_root(&self) -> CVBytes;
-}
-
-impl SubtreeHasher for crate::Hasher {
-    fn set_input_offset(&mut self, offset: u64) -> &mut Self {
-        assert_eq!(self.count(), 0, "hasher has already accepted input");
-        self.core.set_input_offset(offset);
-        self
-    }
-
-    fn finalize_non_root(&self) -> CVBytes {
-        assert_ne!(self.count(), 0, "empty subtrees are never valid");
-        self.clone().take_output().chaining_value()
-    }
-}
-
-#[test]
-#[should_panic]
-fn test_empty_subtree_should_panic() {
-    crate::Hasher::new(crate::Mode::Plain, None).finalize_non_root();
-}
-
-#[test]
-#[should_panic]
-fn test_unaligned_offset_should_panic() {
-    crate::Hasher::new(crate::Mode::Plain, None).set_input_offset(1);
-}
-
-#[test]
-#[should_panic]
-fn test_hasher_already_accepted_input_should_panic() {
-    crate::Hasher::new(crate::Mode::Plain, None).update(b"x").set_input_offset(0);
-}
-
-#[test]
-#[should_panic]
-fn test_too_much_input_should_panic() {
-    crate::Hasher::new(crate::Mode::Plain, None).set_input_offset(CHUNK_LEN as u64).update(&[0; CHUNK_LEN + 1]);
-}
-
-#[test]
-#[should_panic]
-fn test_set_input_offset_cant_finalize() {
-    let mut hasher = crate::Hasher::new(crate::Mode::Plain, None);
-    hasher.set_input_offset(CHUNK_LEN as u64);
-    hasher.finalize();
-}
-
-#[test]
-#[should_panic]
-fn test_set_input_offset_cant_finalize_xof() {
-    let mut hasher = crate::Hasher::new(crate::Mode::Plain, None);
-    hasher.set_input_offset(CHUNK_LEN as u64);
-    hasher.finalize_xof();
-}
-
-/// Every test case hashed as subtrees of 1 to 32 chunks, merged layer by
-/// layer, against the one-shot hash.
+/// Every test case hashed as subtrees of 1 to 32 chunks via `TreeHasher`,
+/// merged layer by layer, against the one-shot hash.
 #[test]
 fn test_grouped_hash() {
+    let tree = crate::throughput::TreeHasher::new(crate::Mode::Plain);
     let parent = |left: &CVBytes, right: &CVBytes| crate::hasher::parent_output(left, right, crate::IV, 0, crate::Platform::detect());
     const MAX_CHUNKS: usize = (TEST_CASES_MAX + 1) / CHUNK_LEN;
     let mut input_buf = [0; TEST_CASES_MAX];
     paint_test_input(&mut input_buf);
-    for subtree_chunks in [1, 2, 4, 8, 16, 32] {
+    for subtree_chunks in [1usize, 2, 4, 8, 16, 32] {
+        let level = subtree_chunks.trailing_zeros();
         let subtree_len = subtree_chunks * CHUNK_LEN;
         for &case in TEST_CASES {
             if case <= subtree_len {
@@ -1884,29 +1983,35 @@ fn test_grouped_hash() {
             }
             let input = &input_buf[..case];
             let expected_hash = crate::convenience::hash(input);
-            let mut chaining_values = ArrayVec::<CVBytes, MAX_CHUNKS>::new();
+            // The first n hold the current level's chaining values.
+            let mut chaining_values: [CVBytes; MAX_CHUNKS] = [[0; 32]; MAX_CHUNKS];
+            let mut n = 0;
             let mut subtree_offset = 0;
+            let mut index = 0u64;
             while subtree_offset < input.len() {
                 let take = core::cmp::min(subtree_len, input.len() - subtree_offset);
-                let subtree_cv = crate::Hasher::new(crate::Mode::Plain, None)
-                    .set_input_offset(subtree_offset as u64)
-                    .update(&input[subtree_offset..][..take])
-                    .finalize_non_root();
-                chaining_values.push(subtree_cv);
+                let slice = &input[subtree_offset..][..take];
+                let subtree_cv = if take == subtree_len {
+                    *tree.subtree_cv(level, index, slice).as_bytes()
+                } else {
+                    *tree.last_cv((subtree_offset / CHUNK_LEN) as u64, slice).as_bytes()
+                };
+                chaining_values[n] = subtree_cv;
+                n += 1;
                 subtree_offset += take;
+                index += 1;
             }
-            assert!(chaining_values.len() >= 2);
-            while chaining_values.len() > 2 {
-                let n = chaining_values.len();
+            assert!(n >= 2);
+            while n > 2 {
                 for i in 0..(n / 2) {
                     chaining_values[i] = parent(&chaining_values[2 * i], &chaining_values[2 * i + 1]).chaining_value();
                 }
                 if n % 2 == 1 {
                     chaining_values[n / 2] = chaining_values[n - 1];
                 }
-                chaining_values.truncate(n / 2 + n % 2);
+                n = n / 2 + n % 2;
             }
-            assert_eq!(chaining_values.len(), 2);
+            assert_eq!(n, 2);
             assert_eq!(expected_hash, parent(&chaining_values[0], &chaining_values[1]).root_hash(), "{case} bytes in subtrees of {subtree_chunks} chunks");
         }
     }
@@ -2023,7 +2128,10 @@ mod prefetch_counts {
     /// the cold one, throughput::hash the warm one.
     #[test]
     fn test_convenience_prefetches_and_performance_does_not() {
-        if !matches!(Platform::detect(), Platform::NEON | Platform::SME2) || !crate::neon_hybrid::sha3_detected() {
+        let on_neon = matches!(Platform::detect(), Platform::NEON);
+        #[cfg(blake3_sme2)]
+        let on_neon = on_neon || matches!(Platform::detect(), Platform::SME2);
+        if !on_neon || !crate::neon_hybrid::sha3_detected() {
             return;
         }
         let blocks = std::vec![crate::throughput::Block::ZERO; 64];
@@ -2048,7 +2156,7 @@ mod prefetch_counts {
         // machine a Hasher::new would take SME2, and the test once returned
         // there, leaving the family's mutants uncaught on SME2 (the VM's
         // whole run, BLAKE3 #219, November 4).
-        let neon = || crate::Hasher::from_core(crate::incremental::HasherCore::new_from(IV, 0, Platform::NEON));
+        let neon = || crate::Hasher::from_core(crate::incremental::HasherCore::new_from(crate::Domain::plain(), Platform::NEON));
         let input = painted(crate::PREFETCH_BELOW + CHUNK_LEN);
         for len in (CHUNK_LEN - 7..=crate::PREFETCH_BELOW + 7).step_by(97).chain([
             CHUNK_LEN,

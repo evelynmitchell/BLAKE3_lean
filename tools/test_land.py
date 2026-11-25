@@ -14,11 +14,21 @@ class Gates(unittest.TestCase):
         self.assertEqual(land.required(["AGENTS.md", "docs/core-api.md"]), ())
 
     def test_code_needs_every_gate_and_proof_inputs_the_proofs(self):
-        code = land.required(["src/lib.rs", "README.md"])
-        self.assertEqual(code, ("CI", "check-builds", "mutants x86_64", "mutants aarch64", "mutants arm64", "tests aarch64", "tests arm64", "cells"))
-        for path in ("c/blake3_neon_hybrid_aarch64.S", "tools/verify/canon.py", "tools/gen_neon_hybrid.py", "c2sp/BLAKE3/Blake3.lean"):
-            self.assertEqual(land.required([path]), code + ("long proofs",), path)
-        self.assertEqual(land.required(["tools/land.py"]), code, "a tool is code")
+        base = ("CI", "check-builds", "mutants x86_64", "mutants arm64", "tests aarch64", "tests arm64")
+        shipped_non_perf = base + ("review",)
+        shipped_perf = base + ("cells", "review")
+        self.assertEqual(land.required(["src/lib.rs", "README.md"]), shipped_perf)
+        for path in ("threads/src/pipeline.rs", "build.rs", "Cargo.toml", "threads/Cargo.toml", "version/src/lib.rs"):
+            self.assertEqual(land.required([path]), shipped_perf, path)
+        for path in ("Cargo.lock", "threads/Cargo.lock"):
+            self.assertEqual(land.required([path]), base + ("cells",), f"perf lockfile only: {path}")
+        for path in ("b3sum/src/main.rs", "b3sum/Cargo.toml", "capi/b3.h", "capi/src/lib.rs"):
+            self.assertEqual(land.required([path]), shipped_non_perf, f"shipped but not benchmarked lib: {path}")
+        for path in ("tools/land.py", "tools/runner/runner.py", "tools/mutants/known-arm64.txt", ".github/workflows/ci.yml", "tests/lifecycle.rs", "b3sum/tests/cli_tests.rs"):
+            self.assertEqual(land.required([path]), base, f"not shipped code: {path}")
+        self.assertEqual(land.required(["c/blake3_neon_hybrid_aarch64.S"]), shipped_perf + ("long proofs",))
+        for path in ("tools/verify/canon.py", "tools/gen_neon_hybrid.py", "c2sp/BLAKE3/Blake3.lean"):
+            self.assertEqual(land.required([path]), base + ("long proofs",), path)
 
     def test_the_newest_status_of_a_gate_stands(self):
         statuses = [{"context": "cells", "state": "success", "description": "new"}, {"context": "cells", "state": "failure", "description": "old"}]
@@ -131,13 +141,50 @@ class Subjects(unittest.TestCase):
 class Landable(unittest.TestCase):
     def test_the_status_text_fits_github_for_every_set_of_gates(self):
         base = "0123456789abcdef"
-        for paths in (["AGENTS.md"], ["src/lib.rs"], ["c/x.S"]):
+        for paths in (["AGENTS.md"], ["tools/land.py"], ["b3sum/src/main.rs"], ["src/lib.rs"], ["c/x.S"]):
             text = land.landable(base, list(land.required(paths)))
             self.assertLessEqual(len(text), 140, paths)
             self.assertTrue(text.startswith("every gate green on top of 0123456789ab: "))
-        self.assertIn("check-builds", land.landable(base, list(land.required(["src/lib.rs"]))))
+        self.assertIn("check-builds", land.landable(base, ["CI", "check-builds", "cells"]), "the gates by name while they fit")
         self.assertTrue(land.landable(base, list(land.required(["c/x.S"]))).endswith(": 9 gates"))
         self.assertTrue(land.landable(base, []).endswith("*.md only"))
+
+
+class CountsRatchet(unittest.TestCase):
+    def test_missing_counts_script_fails_loudly(self):
+        orig_root = land.ROOT
+        try:
+            land.ROOT = "/nonexistent-land-root"
+            with self.assertRaises(SystemExit):
+                land.check_counts("HEAD~1", "HEAD")
+        finally:
+            land.ROOT = orig_root
+
+
+class PushNextRetry(unittest.TestCase):
+    def test_retries_transient_gh006_landable_lag(self):
+        import subprocess
+        sleeps = []
+        responses = [
+            subprocess.CompletedProcess([], 1, "", 'remote: error: GH006: Required status check "landable" is expected.\n'),
+            subprocess.CompletedProcess([], 0, "", "ok\n"),
+        ]
+        land.push_next("deadbeef", run=lambda *a, **k: responses.pop(0), sleep=sleeps.append)
+        self.assertEqual(sleeps, [2])
+
+    def test_non_landable_push_error_does_not_retry(self):
+        import subprocess
+        sleeps = []
+        calls = []
+
+        def fake_run(*a, **k):
+            calls.append(a)
+            return subprocess.CompletedProcess([], 1, "", "remote: error: non-fast-forward\n")
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            land.push_next("deadbeef", run=fake_run, sleep=sleeps.append)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
 
 
 if __name__ == "__main__":

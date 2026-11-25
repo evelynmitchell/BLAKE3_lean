@@ -32,13 +32,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         ref: ${{ github.event.release.tag_name || inputs.tag }}
         # The version commit and its parent, which it names.
         fetch-depth: 2
-    - run: docker run --rm -v "$PWD":/src -w /src ubuntu:26.04 sh tools/b3sum-release-container.sh
-    - uses: actions/upload-artifact@v4
+    - run: docker run --rm -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: b3sum-${{ runner.arch }}
         path: dist/
@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         ref: ${{ github.event.release.tag_name || inputs.tag }}
         # The tag and its commit's files, to compare the crates with.
@@ -74,12 +74,40 @@ jobs:
     # check compares what was published with every builder's copy, and is
     # told which builders there are (the two jobs above, by their
     # artifacts' names): each must have left its folder, with every crate.
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
         pattern: b3sum-*
         path: rebuilt
-    - name: tools/release_artifacts.py TAG --published --rebuilt rebuilt --builders b3sum-X64,b3sum-ARM64
+    - name: tools/release_artifacts.py TAG --published --rebuilt rebuilt --builders b3sum-X64=x86_64-unknown-linux-gnu,b3sum-ARM64=aarch64-unknown-linux-gnu
       env:
         TAG: ${{ github.event.release.tag_name || inputs.tag }}
         GITHUB_TOKEN: ${{ github.token }}
-      run: python3 tools/release_artifacts.py "$TAG" --published --rebuilt rebuilt --builders b3sum-X64,b3sum-ARM64
+      run: python3 tools/release_artifacts.py "$TAG" --published --rebuilt rebuilt --builders b3sum-X64=x86_64-unknown-linux-gnu,b3sum-ARM64=aarch64-unknown-linux-gnu
+
+  close-milestone:
+    name: close the release's completed milestone
+    needs: clean
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        ref: ${{ github.event.release.tag_name }}
+        fetch-depth: 2
+    - name: Take the milestone helper from the code commit in the tag's name
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        git checkout --quiet --detach "${TAG#*+}"
+        test -f tools/close_release_milestone.py || { echo "release predates tools/close_release_milestone.py; skipping"; exit 0; }
+    - name: close completed milestone for TAG
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        test -f tools/close_release_milestone.py || exit 0
+        python3 tools/close_release_milestone.py "$TAG"

@@ -29,7 +29,7 @@ checkout of a release tag, you can rebuild them in Docker or Podman and verify
 that your build matches the published file byte for byte:
 
 ```sh
-docker run --rm -v "$PWD":/src -w /src ubuntu:26.04 sh tools/b3sum-release-container.sh
+docker run --rm -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
 sha256sum dist/b3sum-*
 ```
 
@@ -82,17 +82,14 @@ Arguments:
 Options:
       --keyed                 Use the keyed mode, reading the 32-byte key from stdin
       --derive-key <CONTEXT>  Use the key derivation mode, with the given context string
-  -l, --length <LEN>          The number of output bytes, before hex or sigil encoding [default: 32]
-      --seek <SEEK>           The starting output byte offset, before hex or sigil encoding
+  -l, --length <LEN>          The number of output bytes, before hex encoding [default: 32]
+      --seek <SEEK>           The starting output byte offset, before hex encoding
                               [default: 0]
       --num-threads <NUM>     The most threads hashing at once [default: as fast as b3sum can]
       --no-mmap               Read every file and map none: a file that another program shortens
                               while b3sum hashes it then cannot stop the run
       --no-names              Omit filenames in the output
       --raw                   Write raw output bytes to stdout, rather than hex
-      --sigilcode             Write each hash as a sigil (25 characters for 32 bytes; see
-                              johnservil/sigil), rather than hex, of at most 65536 output bytes;
-                              with --check, read sigils as well as hex
       --tag                   Output BSD-style checksums: BLAKE3 ([FILE]) = [HASH]
   -c, --check                 Read BLAKE3 sums from the [FILE]s and check them
       --quiet                 Skip printing OK for each checked file
@@ -107,11 +104,18 @@ https://github.com/servil-software-factory/BLAKE3/blob/main/b3sum/README.md
 ```
 
 By default, `b3sum` uses all the CPU cores it is allowed: it hashes multiple
-files in parallel and splits large files across threads. On a Linux machine
-with several memory nodes it keeps to one of them, the one that holds the most
-of the CPUs it is allowed (the library's README says more). Pass
-`--num-threads 1` to use a single thread. On Linux, `taskset -c LIST b3sum ...`
-pins `b3sum` to specific CPUs.
+files in parallel and splits large files across threads. (`--raw` and `--tag`
+cannot be combined.) When stdout is a
+terminal, `b3sum` hashes and flushes each completed line in order so results
+appear promptly; when stdout is redirected to a pipe or file, output is
+buffered in 32 KiB chunks. On a Linux machine
+with several memory nodes, runs that use multiple threads (or pass
+`--num-threads` > 1) keep to one node, the one that holds the most of the CPUs
+the process is allowed (the library's README says more); single-threaded runs
+(`--num-threads 1` or single-threaded paths such as one small regular file)
+skip topology discovery and bind nothing. Pass `--num-threads 1` to use a
+single thread. On Linux, `taskset -c LIST b3sum ...` pins `b3sum` to specific
+CPUs.
 
 See [What `--check` does](what_does_check_do.md) for checkfile rules.
 
@@ -121,8 +125,12 @@ See [What `--check` does](what_does_check_do.md) for checkfile rules.
 file during the run, the file hashed is still the one that was opened.
 
 **Hash files that are not changing.** `b3sum` takes no lock and no snapshot.
-If another program writes to a file while `b3sum` hashes it, the hash printed
-may be of bytes that the file never held all at once.
+Any path that memory-maps a file relies on the underlying file not being
+modified concurrently while `b3sum` hashes it (under Rust's memory model,
+external in-place writes into a live shared mapping violate the immutability
+contract of `&[u8]`, in addition to producing torn digests or `SIGBUS` on
+truncation). Pass `--no-mmap` whenever hashing live, untrusted, or potentially
+changing files.
 
 How much of the file is hashed depends on how `b3sum` takes it in:
 
@@ -142,34 +150,54 @@ any other place it is read, from there. Either way it is left at the file's
 end, as a stream read to its end is.
 
 Standard input is one stream, so name it once. Named again (`b3sum - -`), or
-by another of its names under `/dev` or `/proc` (`b3sum - /dev/stdin`,
-`b3sum /dev/stdin /dev/fd/0`), it goes to the first of the names, and the
-others find it at its end and hash no bytes. The entries of a checkfile
+by another of its names under `/dev` or `/proc` — absolute or relative to the
+working directory (`b3sum - /dev/stdin`, `cd /dev && b3sum - stdin`,
+`b3sum /dev/stdin /dev/fd/0`) — it goes to the first of the names, reading
+directly from standard input (including for inherited sockets and named FIFOs),
+and the others find it at its end and hash no bytes. The entries of a checkfile
 that name it are taken the same way, in the order of their lines. A name
 for the pipe anywhere else (a link of your own) is taken for a file of its
 own, and two readers of one pipe each get a part of it.
-Where standard input is a file, another name for it (`/dev/stdin`) opens
-that file again from its start, and is hashed as a file of its own.
+Where standard input is a regular file, another name for it (`/dev/stdin`,
+`/dev/fd/0`) hashes that file independently from byte zero on both Linux and
+macOS (using positioned reads on macOS so the shared descriptor offset is not
+disturbed).
 
 What happens when a file changes during the run:
 
-| The file... | Read | Mapped |
+| The file... | Read (including `--no-mmap` and `O_DIRECT`) | Mapped (`mmap`) |
 |---|---|---|
-| grows at its end | the added bytes are hashed if they arrive before `b3sum` reaches the end | the added bytes are not hashed |
-| is cut short | if `b3sum` had already read past the new end, it prints the hash of what it read: a file that never existed | `b3sum` stops with an error and prints no hash, unless the cut falls inside the file's last page of memory (4 KiB on most machines): then the missing bytes read as zeros, and it prints the hash of a file that never existed |
-| is overwritten in place | old bytes and new bytes may be mixed | the same |
+| grows at its end | the added bytes are hashed if they arrive before `b3sum` reaches EOF | the added bytes are not hashed (mapped length is fixed at open) |
+| is cut short | if `b3sum` had already read past the new end (or across parallel `O_DIRECT` regions), it prints the hash of the bytes it read: a file that never existed | `b3sum` stops with `SIGBUS` and prints no hash, unless the cut falls inside the file's last memory page (4 KiB on most x86-64/Linux hosts, 16 KiB on Apple Silicon): then the missing bytes read as zeros, and it prints the hash of a file that never existed |
+| is overwritten in place | old bytes and new bytes may be mixed (and parallel `O_DIRECT` readers can visit different regions concurrently) | old bytes and new bytes may be mixed (and external writes into a live shared mapping violate `&[u8]` immutability) |
 
-`b3sum` does not yet detect these cases
-([#443](https://github.com/servil-software-factory/BLAKE3/issues/443)).
+**Why `b3sum` does not try to detect concurrent modification automatically:**
+like `sha256sum`, `md5sum`, and official `b3sum`, `b3sum` does not lock input
+files or re-`fstat` them after reading. A post-read metadata check adds syscall
+overhead to every hashed file while still missing same-size or same-mtime
+in-place overwrites.
+
+**How to hash files safely when writers may be active:**
+
+- Pass `--no-mmap` whenever hashing live, untrusted, or potentially changing
+  files so truncation cannot trigger `SIGBUS` and concurrent writers cannot
+  mutate a live shared mapping.
+- If you need a guaranteed point-in-time digest of a file on a live filesystem,
+  take a copy-on-write clone or filesystem snapshot first (for example APFS
+  `cp -c`, Btrfs/XFS `cp --reflink=always`, or a ZFS/Btrfs/LVM snapshot) and
+  hash the snapshot. Opt-in OS reflink/snapshot support in `b3sum` is tracked
+  in [#550](https://github.com/servil-software-factory/BLAKE3/issues/550).
 
 ## Direct I/O for large cold files
 
-On Linux, `b3sum` reads cold files of 4 MiB or more with direct I/O (bypassing
-the page cache) when hashing a single file, or when hashing any file with
-`--outboard`. Bypassing the cache avoids extra memory copies and leaves the page
-cache undisturbed when hashing large sets of files once. On a Ryzen 9700X with
-NVMe storage, hashing a cold 1 GiB file drops from 0.22 s through the page cache
-to 0.10 s with direct I/O.
+On Linux, `b3sum` reads cold files with direct I/O (bypassing the page cache)
+when hashing a single file of 4 MiB or more, multiple files of 32 MiB or more
+when at least 4 direct-I/O threads per file worker are available (or 4 MiB or
+more when `io_uring` is unavailable), or any file of 4 MiB or more with
+`--outboard`. Bypassing the cache avoids extra memory copies and leaves the
+page cache undisturbed when hashing large sets of files once. On a Ryzen 9700X
+with NVMe storage, hashing a cold 1 GiB file drops from 0.22 s through the page
+cache to 0.10 s with direct I/O.
 
 ## Outboards for verified streaming
 
@@ -183,7 +211,8 @@ that part arrives.
 - Files of 16 KiB or less have no parent nodes, so no `.obao4` file is written.
 - `DIR` must already exist.
 - Works in plain mode and `--keyed` mode.
-- Standard input (`-`) is read whole into memory first.
+- Standard input (`-`) and any named file whose fallback reads instead of
+  mapping are held whole in memory when building the outboard tree.
 
 ```bash
 $ mkdir outboards && b3sum --outboard outboards big.iso
@@ -191,23 +220,3 @@ $ mkdir outboards && b3sum --outboard outboards big.iso
 $ ls outboards
 5da5ad397cd129294c30f415b7d4e091b155a5faa37ba0b154ed10a5e5dbfca9.obao4
 ```
-
-## Hashes as sigils
-
-`--sigilcode` prints each 32-byte hash as a 25-character
-[sigil](https://github.com/johnservil/sigil) instead of hex. A sigil is a
-single word (easy to double-click to select), uses visually distinct characters,
-and includes its own error check so typos or swapped adjacent characters fail
-before hashing begins. With `--check --sigilcode`, checkfiles may mix sigils and
-hex. A sigil is made whole, in memory, so `--length` may ask for at most 65,536
-output bytes with `--sigilcode`.
-
-```
-$ b3sum --sigilcode empty
-ᢳᕌᔃጾዿᑂഔጕꔍⶰᣟꕄꕛቴⴲజᐽᙿᕯⶂጁᑃሃᛜጩ  empty
-$ b3sum --sigilcode empty > sums.b3 && b3sum --sigilcode --check sums.b3
-empty: OK
-```
-
-Without `--sigilcode`, `b3sum` expects hex only, and `--check` will tell you if
-a line looks like a sigil.

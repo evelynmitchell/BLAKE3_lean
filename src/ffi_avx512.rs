@@ -2,11 +2,13 @@ use crate::{BLOCK_LEN, CVWords, IncrementCounter, OUT_LEN};
 
 // Unsafe because this may only be called on platforms supporting AVX-512.
 pub unsafe fn compress_in_place(cv: &mut CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) {
+    // Sound: caller verified AVX-512F+VL support; `cv` and `block` are valid non-overlapping fixed-size references.
     unsafe { ffi::blake3_servil_compress_in_place_avx512(cv.as_mut_ptr(), block.as_ptr(), block_len, counter, flags) }
 }
 
 // Unsafe because this may only be called on platforms supporting AVX-512.
 pub unsafe fn compress_xof(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8) -> [u8; 64] {
+    // Sound: caller verified AVX-512F+VL support; `cv`, `block`, and `out` are valid non-overlapping fixed-size buffers.
     unsafe {
         let mut out = [0u8; 64];
         ffi::blake3_servil_compress_xof_avx512(cv.as_ptr(), block.as_ptr(), block_len, counter, flags, out.as_mut_ptr());
@@ -25,11 +27,13 @@ pub unsafe fn hash_many<const N: usize>(
     flags_end: u8,
     out: &mut [u8],
 ) {
+    const { assert!(N > 0 && N % BLOCK_LEN == 0, "hash_many inputs are whole blocks") };
+    // Sound: caller verified AVX-512F+VL support; `inputs` holds valid `N`-byte pointers and `out` is checked below to hold `inputs.len() * OUT_LEN` bytes.
     unsafe {
         // The Rust hash_many implementations do bounds checking on the `out`
-        // array, but the C implementations don't. Even though this is an unsafe
-        // function, assert the bounds here.
-        assert!(out.len() >= inputs.len() * OUT_LEN);
+        // array, but the assembly implementations don't. Even though this is
+        // an unsafe function, assert the bounds without multiplying `inputs.len()`.
+        assert!(inputs.len() <= out.len() / OUT_LEN);
         // Linux, on a CPU where they pay (platform::wide_avx512): groups of
         // 32 whole chunks take the 32-input kernel, and groups of 16 parent
         // nodes the 16-input one; the rest, every other shape, and every
@@ -103,11 +107,12 @@ pub const XOF_PROVED_BLOCKS: usize = 32;
 // Unsafe because this may only be called on platforms supporting AVX-512.
 #[cfg(unix)]
 pub unsafe fn xof_many(cv: &CVWords, block: &[u8; BLOCK_LEN], block_len: u8, counter: u64, flags: u8, out: &mut [u8]) {
-    debug_assert_eq!(0, out.len() % BLOCK_LEN, "whole blocks only");
+    assert_eq!(0, out.len() % BLOCK_LEN, "whole blocks only");
     for (i, part) in out.chunks_mut(XOF_PROVED_BLOCKS * BLOCK_LEN).enumerate() {
         let blocks = part.len() / BLOCK_LEN;
-        debug_assert!((1..=XOF_PROVED_BLOCKS).contains(&blocks), "a call within the proof's 1 to 32 blocks");
+        assert!((1..=XOF_PROVED_BLOCKS).contains(&blocks), "a call within the proof's 1 to 32 blocks");
         let at = counter + (i * XOF_PROVED_BLOCKS) as u64;
+        // Sound: caller verified AVX-512F+VL support; `part` holds `blocks * BLOCK_LEN` writable bytes within the proved 1..=32 range.
         unsafe { ffi::blake3_servil_xof_many_avx512(cv.as_ptr(), block.as_ptr(), block_len, at, flags, part.as_mut_ptr(), blocks) };
     }
 }

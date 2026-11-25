@@ -1,3 +1,165 @@
+# blake3-servil 0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc, against blake3-servil 0.10.0
+
+What changed since `0.10.0`, each item with its issue or commit. Every
+figure names its machine.
+
+## Breaking changes and migration
+
+- **Removed optional `serde` feature** (`15194e18`, `#479`): `Hash` no
+  longer implements `serde::Serialize` / `serde::Deserialize`. Callers
+  that previously enabled `features = ["serde"]` can drop the feature
+  and serialize `*hash.as_bytes()` (32-byte array) / reconstruct with
+  `Hash::from_bytes` in a local adapter to keep the same wire format.
+- **Removed `b3sum --sigilcode`** (`2c221200`, `#479`): `--sigilcode`
+  was experimental and is no longer shipped in `b3sums`. Existing
+  manifests written with `--sigilcode` will need to be re-generated in
+  standard hex.
+- **Parameterized `Pipeline` / `Event` batch type (`#509`):** `Pipeline<T, B = (), P = Batch<'static>>` and `Event<T, B = (), P = Batch<'static>>` add a third default type parameter `P` so `Pipeline::batch` accepts `Packed<16/32/48>`, `Vec<[u8; N]>`, and `Box<[[u8; N]]>` via `Pipeline::with_batches` / `Pipeline::with_owners_and_batches`. Existing `Pipeline::new` and `Pipeline::with_owners` callers keep `P = Batch<'static>` without change, but standalone `Event::Hashed` / `Event::Aborted` literals constructed outside a `Pipeline` context (e.g. `Event::Aborted { tag: 0, owner: None }`) now need a type annotation such as `Event<u32, ()>` so `P` is constrained.
+- **Arm `PSTATE.DIT` for `Hash`/`Cv`/`LastCv` equality** (`6366776f`,
+  `#479`): owned branchless integer assembly (`src/ct.rs`) replaces
+  `constant_time_eq` and leaves Arm `PSTATE.DIT` as the calling thread
+  has it (matching hashing, avoiding the 16–18× per-call `msr dit`
+  penalty measured on Apple M6 and AmpereOne). Callers that want Arm's
+  hardware DIT guarantee should enable `DIT` in their threads across
+  both hashing and digest verification.
+
+## Supply-chain hardening (`#479`, `#487`)
+
+- **Zero third-party runtime or build dependencies in shipped library crates**
+  (`blake3-servil-core`, `blake3-servil`, `blake3-servil-c`) on every
+  supported platform (`6366776f`, `e36ef4d1`): owned `src/ct.rs` replaces
+  `constant_time_eq`, AArch64 `sysctlbyname`/`getauxval` use direct
+  `extern "C"` with native `#[link(name = "c")]` directives (`libc` is
+  dev-only), and all assembly kernels compile via `core::arch::global_asm!`
+  (dropping `cc` and external C-compiler requirements for library builds).
+- **`b3sums` trimmed to `blake3-servil` + `libc`** (`2c221200`):
+  replaced `memmap2`, `anyhow`, `tempfile`, `duct`, and `hex`, shrinking
+  `b3sum/Cargo.lock` from 57 to 26 registry packages.
+- **Release workspace trimmed & `cargo-vet` provenance isolated**
+  (`15194e18`, `faa2c07b`): `tools/release/Cargo.lock` shrank from 112
+  to 61 registry packages and exemptions from 86 to 41, with explicit
+  custom `agent-safe-to-deploy` / `agent-safe-to-run` `cargo-vet`
+  criteria separating AI-agent audits from human audits.
+
+## Safety and assurance
+
+- **Stateful-type & defense-in-depth rollout (`#499`, `2291a502`–`69dfdccc`):**
+  private fields, checked constructors, and RAII guards across `Domain`,
+  `Stage`, `CvStack`, `Block`, `Batch`, `TreeHasher`/`Cv`/`LastCv`,
+  `Loan`, and `FileEnd`; crate `[lints]` tables denying narrowing `as`
+  casts (`clippy::cast_possible_truncation = "deny"`, zero shipped
+  suppressions) and `clippy::correctness`; `// Sound:` verified across
+  all five shipped crates & build scripts (`tools/unsafe_reasons.py`);
+  custom guard-page global allocators (`tests/guard_alloc.rs`,
+  `threads/tests/guard_alloc.rs`); arithmetic lifecycle work counts; and
+  non-rising `tools/counts.py` ratchet. Validated by 12 blinded
+  before/after GPT Astra audits (**−82.7%** findings, `168 → 29`, `0`
+  memory-safety findings, `0` Apple M6 regressions).
+- **Startup publication & fail-stop (`#514`, `bd18c8c5`):** `self_test::ensure()`
+  fast path now uses `Ordering::Acquire` to formally synchronize with
+  `DETECTED` publication on weak-memory CPUs, and Unix `stop()` requires
+  exact `pfd.revents == POLLOUT` (fixing broken-pipe `SIGPIPE` in C hosts
+  and `b3sum`) with an `alarm(1)` guard on raw `write(2)`.
+- **Enforced per-function stack budgets & 128 KiB cold `initialize()` safety
+  (`#499`, `#509`, `04b9489d`, `89a64fba`):** `tools/stack_budget.py` parses
+  ELF `.stack_sizes` in `tools/check-builds.sh` (≤ 128 KiB `core`/`b3sum`,
+  ≤ 32 KiB `Hasher` non-update APIs, ≤ 16 KiB `threads`). Cold `self_test`
+  frames stay out-of-line with an 8 KiB SME2 stack tier
+  (`walk_on_stack_small`) and in-place `chunks_keyed` init, verified on
+  128 KiB threads (`tests/initialize_stack.rs`).
+- **Per-PR AArch64 Linux SME2 CI execution coverage (`#412`, `7af3b05b`):**
+  restored Linux SME2 execution testing via a parallel `AArch64 Linux SME2
+  (QEMU 512-bit SVL)` CI job using SHA-256 + BLAKE3 pinned Debian
+  `qemu-user 11.1.2`, explicitly verifying `HWCAP2_SME2`, `rdsvl == 64`,
+  the core & threads suites, and SME2 fail-stop on every landing.
+- **Panic-safe `Pipeline` submission, compact `Rooms::refs`, & `#465`
+  tooling hardening (`dec50d97`, `64dc6939`, `4e76366a`, `1b6f3178`,
+  `05dc723e`, `4a98640b`, `55de8c84`, `93e3461f`, `ee9ab359`, `80e57abf`,
+  `3b66d989`):** panic-safe `Pipeline` submission with fork stop in wait
+  loops and `ROOM_CLOSING_BIT` / compact `Rooms::refs` (`#494`);
+  independent `.b3` release checksums alongside `.sha256` (`#446`);
+  least-privilege automatic GitHub release milestone closure (`05dc723e`);
+  deterministic single-CGU `tools/size.py`; `tools/gen-ver.py` atomic
+  `update-ref` rollback and `index.lock` guard; and `tools/mutants`
+  sibling-shard cleanup and `rc=4` incremental-cache self-healing.
+- **`b3sum` OS edge-case hardening, terminal flushing, & lazy NUMA
+  (`#515`, `#469`, `#465`, `d8318dc3`, `493ef6f1`, `b49942b2`):** rejects
+  `SOCK_SEQPACKET`/`SOCK_DGRAM` inputs across all paths, keeps `pipe2(O_DIRECT)`
+  packet reads ≥ `sysconf(_SC_PAGESIZE)` across `fill()`,
+  `read_stream_to_end()`, and checkfile `BufReader`, anchors
+  `/dev`/`/proc` checks at root and excludes `/dev/ptmx`, isolates
+  macOS `/dev/fd/<N>` regular-file offsets via `PreadReader`, shares
+  one `ThreadBudget` across `--num-threads`, defers Linux NUMA node
+  confinement until threads are actually needed, flushes completed output
+  lines immediately on terminals while preserving 32 KiB buffering on pipes,
+  and rejects contradictory `--raw --tag`.
+
+## Performance and new APIs (`#336`, `#376`, `#389`, `#398`, `#404`, `#448`, `#501`, `#509`, `#511`, `#512`, `#523`, `#527`)
+
+- **Direct-load SIMD `Packed<16/32/48>` kernels across all 4 ISAs
+  (`#501`, `36402294`):** AVX-512 16-way, AVX2 8-way, Apple SME2 16-way,
+  and AArch64 NEON `8+3` 11-way (`no_std`, 36/36 Z3 proofs), removing
+  the 8 KiB stack expansion on full SIMD groups — up to `2.55×` faster
+  `Packed<32>` on Apple M6 (`18.77 → 7.36 ns/h`), `-42.5%` (`1.74×`) on
+  Apple M4 `MerkleTree 65536×32 B`, and `-21.1%` on Ryzen 9700X.
+- **Register-only `hash_counter_range` across all 4 ISAs (`#511`,
+  `846ca533`):** hashes a 4..=64-byte single-block template over a
+  consecutive range of one 32-bit counter word in any `Mode` (plain,
+  keyed, or derive-key) without materializing per-message input buffers
+  across AVX-512, AVX2, Apple SME2, and AArch64 NEON (`no_std`, 45/45
+  Z3 proofs; `1.49×` end-to-end BLINCS `from_seed` speedup on Apple M6,
+  `-55%` instructions).
+- **Zero-copy `Packed<N>` & `Pipeline` ergonomics (`#509`, `#512`,
+  `#502`, `d13e5037`, `7b7a4509`, `905e5eba`, `1ecb67ff`, `444e6ef7`):**
+  added `Packed<48>`, borrowed `&[[u8; 16/32/48]]` via `Prepared + ?Sized`,
+  `Pipeline::message_with` for per-message `Mode`, `Pipeline::with_batches`
+  / `with_owners_and_batches` accepting `Packed<16/32/48>`, `Vec<[u8; N]>`,
+  and `Box<[[u8; N]]>`, compression-work-based batch admission, and
+  measured Apple M4/M6 SME2 crossover guidance on `TreeHasher::on_this_core()`.
+- **AArch64 SIMD & SME2 kernels (`#527`, `#523`, `#336`, `172da807`,
+  `eb8d7a0e`, `c2fe4ef6`):** enabled `128..1024 B` borrowed-group SIMD
+  on AArch64 (`-53.3%` / `2.14×` on Apple M6 `ContinuousMessages | 1 KiB`,
+  `-35.7%` on `512 B`), zero-spill sequential scalars in NEON
+  `k6`/`k8`/`k10`/`kn6`/`pn6`/`pn10`, per-lane-key SME2 keyed chunks,
+  and NEON `output8` kernels.
+- **x86-64 EVEX partial-chunk, `hash_each`, & `finalize_each` SIMD wave
+  (`#376`, `#398`, `#404`, `#448`, `e60cfd27`, `8030cb39`, `704dcd1c`,
+  `c1a91893`, `7ecc8803`, `6348b723`, `c891b2b8`, `5d250f20`):**
+  zero-spill EVEX AVX-512F+VL partial-chunk kernels (`4`/`8`/`16` lanes,
+  80/80 Z3 proof cases); SIMD partial last chunks and in-place Merkle reduction
+  in `hash_each` (Apple M6 `Collection | Nix files -10.8%` and `git
+  objects -10.2%` instructions); SIMD `output16`/`output8` final blocks
+  in `hash_each` (up to `5.3×`) and staged/padded `finalize_each`
+  (`5.03×–6.54×` Zen 5, `2.41×–2.97×` Ice Lake); out-of-line slow path
+  for `hash_many_rounded` on powers of two (Zen 5 `4 KiB -7.4%`, `8 KiB
+  -5.7%`); and 8 dead CV-transpose shuffles dropped from `output16`.
+- **Adaptive per-ticket `Pipeline::batch` local-wake learning (`#389`,
+  `5d3a9ac5`):** learns per-ticket when waking the pool helps (`EPYC
+  9255 -58.9%`, `EPYC 7443 -59.2%`, zero Apple M6 regressions).
+- **`b3sum` multi-file Linux `O_DIRECT` (`716c7cee`):** uses direct I/O
+  for cold `>= 32 MiB` files in multi-file runs when at least 4 readers
+  per file worker are available (skipping warm files via `mincore`).
+
+## Slower
+
+In full native `bench-hashes check --cells all` runs comparing `0.11.0`
+against `0.10.0` (alongside 70+ faster cells up to `-83.5%` on x86-64
+and `-68.7%` on Apple M6), three small `Pipeline` (`blake3-servil-mt`)
+edge cells read slower on x86-64 (tracked for follow-up in `#556`):
+
+- **AMD EPYC 9255 (Zen 5):** `solo | ContinuousBatches | 1024`: `+6.1%`
+  (traded in `#389` / `5d3a9ac5` for `-58.2%` on `65536`, `-48.9%`
+  `shared-one-cache | 65536`, `-42.8%` `shared-two-caches | 65536`, and
+  `-27.2%` `shared-one-cache | 16384`).
+- **2× Intel Xeon Gold 6330 (Ice Lake):** `solo | ContinuousMessages |
+  4 KiB`: `+5.8%`.
+- **2× AMD EPYC 7443 (Zen 3, AVX2):** `shared-two-caches |
+  ContinuousMessages | 64 B`: `+15.4%` (wide run-to-run variance,
+  `-16.7%..+54.8%`; `solo` and `shared-one-cache` are level, and
+  `shared-one-cache | ContinuousBatches | 16384` is `-40.5%`).
+
+---
+
 # blake3-servil 0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d, against blake3-servil 0.9.1
 
 What changed since 0.9.1 (0.9.0 with the one fix of GHSA-q4c5-2759-8c8x), each item with where it is described. Every

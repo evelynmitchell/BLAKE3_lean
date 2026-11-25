@@ -2,7 +2,7 @@
 # program it installs is b3sum.
 [package]
 name = "b3sums"
-version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+version = "0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc"
 authors = ["Jack O'Connor <oconnor663@gmail.com>", "John Servil"]
 description = "b3sum, the BLAKE3 command-line hasher, on blake3-servil: the same digests, faster"
 repository = "https://github.com/servil-software-factory/BLAKE3"
@@ -17,23 +17,15 @@ path = "src/main.rs"
 [features]
 
 [dependencies]
-anyhow = "1.0.25"
-blake3 = { version = "=0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d", path = "../threads", package = "blake3-servil" }
-clap = { version = "4.0.8", features = ["derive", "wrap_help"] }
-hex = "0.4.0"
-# --sigilcode: each hash as a sigil (johnservil/sigil), its full version pinned.
-sigilcode = "=0.1.0+81af550bfd3eb2aff85c3ddf0a21446e78a1809d"
+blake3 = { version = "=0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc", path = "../threads", package = "blake3-servil" }
 
-# A file already in the page cache is mapped and hashed in place.
+# Unix syscalls: memory-mapped reads, direct I/O, io_uring, signals, fstat.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-memmap2 = "0.9"
 
 [dev-dependencies]
 # bao-tree, the outboard's independent implementation (--outboard's tests).
 bao-tree = { version = "=0.17.0", default-features = false }
-duct = "1.0.0"
-tempfile = "3.1.0"
 
 # A panic stops the process at once (crash-only): nothing unwinds past a
 # thread's reads that the kernel still has in flight, whose buffers the
@@ -43,3 +35,18 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+style = { level = "allow", priority = -1 }
+perf = { level = "allow", priority = -1 }
+cast_possible_truncation = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

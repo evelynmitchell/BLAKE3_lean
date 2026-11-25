@@ -11,7 +11,7 @@ Call `initialize()` once at startup before hashing. Hashing functions live in tw
 - `convenience` takes ordinary `&[u8]` slices and is tuned for occasional calls amid other work.
 - `throughput` takes 64-byte-aligned `Block`s and batches, writes into caller-supplied buffers, and is tuned for sustained back-to-back calls.
 
-Disable default features (`default-features = false`) for an allocator-free `no_std` build. The optional `serde` feature adds `Serialize` and `Deserialize` for `Hash`. The crate does not wipe what it held from memory.
+Disable default features (`default-features = false`) for an allocator-free `no_std` build. The crate does not wipe what it held from memory.
 
 `blake3-servil` re-exports this crate and adds multithreading via a shared thread pool. [`capi/b3.h`](../capi/b3.h) provides the convenience API for C and C++.
 
@@ -39,11 +39,23 @@ const fn as_bytes(&self) -> &[u8; 32]
 const fn from_bytes(bytes: [u8; 32]) -> Self
 const fn as_slice(&self) -> &[u8]
 fn from_slice(bytes: &[u8]) -> Result<Self, TryFromSliceError>
-fn to_hex(&self) -> ArrayString<{ _ }>
+fn to_hex(&self) -> HexHash
 fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, HexError>
 ```
 
-Implements: `Clone`, `Copy`, `Debug`, `Deserialize`, `Display`, `Eq`, `From`, `FromStr`, `Hash`, `PartialEq`, `Serialize`.
+Implements: `Clone`, `Copy`, `Debug`, `Display`, `Eq`, `From`, `FromStr`, `Hash`, `PartialEq`.
+
+
+### `struct HexHash`
+
+The 64 lowercase hexadecimal characters of a `Hash`, held inline with no heap allocation.
+
+```rust
+fn as_str(&self) -> &str
+fn as_bytes(&self) -> &[u8; 64]
+```
+
+Implements: `AsRef`, `Borrow`, `Clone`, `Copy`, `Debug`, `Deref`, `Display`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`.
 
 
 ### `struct HexError`
@@ -125,12 +137,12 @@ The throughput API, for power users.
   The hash of each message, of any lengths, on the calling thread.
 - `fn update_each(hashers: &mut [Hasher], pieces: &[(usize, &[u8])])`  
   Feed each piece to its hasher.
-- `fn update_each_with(hashers: &mut [Hasher], pieces: &[(usize, &[u8])], min_len: usize, halves: &dyn Fn(&TreeHasher, u32, u64, &[u8]) -> [Cv; 2])`  
-  Feed a turn of pieces, letting the caller hash large whole subtrees.
 - `fn hash(mode: Mode<'_>, input: &[Block], len: usize) -> Hash`  
   The hash in `mode` of the message of `len` bytes that starts `input`.
-- `fn hash_many<P: Prepared>(mode: Mode<'_>, batch: &P, out: &mut [[u8; 32]])`  
+- `fn hash_many<P: Prepared + ?Sized>(mode: Mode<'_>, batch: &P, out: &mut [[u8; 32]])`  
   The hashes of a `Batch`'s messages, in `mode`, on the calling thread.
+- `fn hash_counter_range(mode: Mode<'_>, template: &[u8], counter_word: usize, start: u32, out: &mut [[u8; 32]])`  
+  Hash `out.len()` single-block messages derived from `template` (`4..=64` bytes) in `mode`, replacing the 4-byte little-endian word at byte offset `counter_word * 4` with `start.wrapping_add(i)` (modulo 2^32) for `i in 0..out.len()`.
 - `fn context_key(context: &str) -> ContextKey`  
   Hash a key-derivation context string and return a `ContextKey`.
 - `const fn level_of(len: u64) -> u32`  
@@ -164,6 +176,7 @@ fn is_empty(&self) -> bool
 fn blocks(&self) -> &[Block]
 fn message_mut(&mut self, i: usize) -> &mut [u8]
 fn set(&mut self, i: usize, message: &[u8])
+fn messages_mut(&mut self) -> impl ExactSizeIterator<Item = &mut [u8]>
 fn blocks_mut(&mut self) -> &mut [Block]
 fn digests_mut(&mut self) -> &mut [[u8; 32]]
 ```
@@ -234,7 +247,8 @@ A `Mode` prepared for a program that builds or verifies a BLAKE3 tree itself (ve
 fn new(mode: Mode<'_>) -> Self
 fn on_this_core(self) -> Self
 fn hash(&self, input: &[u8]) -> Hash
-fn hash_many<P: Prepared>(&self, batch: &P, out: &mut [[u8; 32]])
+fn hash_many<P: Prepared + ?Sized>(&self, batch: &P, out: &mut [[u8; 32]])
+fn hash_counter_range(&self, template: &[u8], counter_word: usize, start: u32, out: &mut [[u8; 32]])
 fn hash_each(&self, items: &[(&[Block], usize)], out: &mut [[u8; 32]])
 fn subtree_cv(&self, level: u32, index: u64, input: &[u8]) -> Cv
 fn subtree_halves(&self, level: u32, index: u64, input: &[u8]) -> [Cv; 2]

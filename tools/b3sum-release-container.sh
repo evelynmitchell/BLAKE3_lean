@@ -4,7 +4,7 @@
 # machines build b3sum's release binary (.github/workflows), and how
 # anyone can, with Docker or Podman, from a clone at a release's tag:
 #
-#     docker run --rm -v "$PWD":/src -w /src ubuntu:26.04 sh tools/b3sum-release-container.sh
+#     docker run --rm -v "$PWD":/src -w /src "$(sed -n 's/^image //p' tools/b3sum-release.toolchain)" sh tools/b3sum-release-container.sh
 #
 # The binary and its digests are then in dist/: the same bytes as the
 # release's, or the release's was not built from this source.
@@ -25,7 +25,16 @@ $apt install -y --no-install-recommends --allow-downgrades $libc || {
 	# shellcheck disable=SC2086
 	$apt install -y --no-install-recommends --allow-downgrades --snapshot "$(want apt-snapshot)" $libc
 }
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(want rustc)"
+case "$(uname -m)" in
+	x86_64)  rustup_arch=x86_64-unknown-linux-gnu;  rustup_sha=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+	aarch64) rustup_arch=aarch64-unknown-linux-gnu; rustup_sha=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+	*) echo "b3sum-release-container: unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+curl --proto '=https' --tlsv1.2 -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.29.3/$rustup_arch/rustup-init"
+printf '%s  /tmp/rustup-init\n' "$rustup_sha" | sha256sum -c
+chmod +x /tmp/rustup-init
+/tmp/rustup-init -y --profile minimal --default-toolchain "$(want rustc)"
+rm /tmp/rustup-init
 . "$HOME/.cargo/env"
 git config --global --add safe.directory '*'
 sh tools/b3sum-release.sh

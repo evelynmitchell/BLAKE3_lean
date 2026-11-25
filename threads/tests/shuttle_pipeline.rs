@@ -124,7 +124,8 @@ mod pipeline;
 
 // What src/pipeline.rs takes from its crate's root: the core library's
 // own items, as threads/src/lib.rs names them.
-pub(crate) use blake3_servil_core::thread_support::{Platform, assert_slots, slot_len};
+pub(crate) use blake3_servil_core::BLOCK_LEN;
+pub(crate) use blake3_servil_core::thread_support::{Platform, assert_slots};
 pub(crate) use blake3_servil_core::{CHUNK_LEN, Hash, Mode, OUT_LEN, convenience};
 pub(crate) mod throughput {
     pub use blake3_servil_core::throughput::*;
@@ -160,27 +161,27 @@ mod lanes {
 
     pub(crate) struct Task {
         pub(crate) len: usize,
-        pub(crate) batch: Option<usize>,
+        pub(crate) batch: Option<(usize, usize)>,
         pub(crate) members: usize,
         pub(crate) member: [Member; MEMBERS],
     }
     unsafe impl Send for Task {}
 
     impl Task {
-        pub(crate) fn members(batch: Option<usize>) -> Task {
+        pub(crate) fn members(batch: Option<(usize, usize)>) -> Task {
             Task { len: 0, batch, members: 0, member: [NO_MEMBER; MEMBERS] }
         }
 
         /// As the pool's, each member alone.
-        pub(crate) fn run_members(&self, tree: &TreeHasher, platform: Platform) {
+        pub(crate) unsafe fn run_members(&self, tree: &TreeHasher, platform: Platform) {
             for m in &self.member[..self.members] {
                 // A worker may be switched away from before each member.
                 shuttle::thread::yield_now();
                 let bytes = unsafe { core::slice::from_raw_parts(m.input, m.len) };
-                if let Some(message_len) = self.batch {
-                    let slot = crate::slot_len(message_len);
+                if let Some((message_len, slot)) = self.batch {
                     let digests = unsafe { core::slice::from_raw_parts_mut(m.out as *mut [u8; crate::OUT_LEN], m.len / slot) };
-                    tree.hash_slots_on(platform, bytes, message_len, slot, digests);
+                    let part = unsafe { crate::throughput::Part::from_checked_slots(bytes, message_len, slot) };
+                    tree.hash_many_on(platform, &part, digests);
                 } else {
                     let hash = tree.hash_on(platform, bytes);
                     unsafe { core::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), m.out, crate::OUT_LEN) };
@@ -209,6 +210,26 @@ mod lanes {
     }
     pub(crate) fn poll_pause(_: &mut std::time::Instant) {
         shuttle::thread::yield_now();
+    }
+
+    pub(crate) mod places {
+        #[derive(Clone, Copy)]
+        pub(crate) enum Kind {
+            PipelineBatch,
+        }
+        #[derive(Clone, Copy)]
+        pub(crate) struct Plan {
+            pub(crate) in_flight: usize,
+        }
+        impl Plan {
+            pub(crate) fn new(_kind: Kind, _work_bytes: usize, _all: usize) -> Self {
+                Self { in_flight: 1 }
+            }
+            pub(crate) fn near(&self) -> bool {
+                false
+            }
+            pub(crate) fn done(&self) {}
+        }
     }
 
     pub(crate) mod sources {
@@ -253,7 +274,7 @@ mod lanes {
             pub(crate) fn unregister(slot: usize) {
                 REGISTERED.lock().unwrap().retain(|&at| at != slot);
             }
-            pub(crate) fn publish_actions(&self, run: unsafe fn(*const (), u64, Platform), context: *const (), args: &[u64]) {
+            pub(crate) unsafe fn publish_actions(&self, run: unsafe fn(*const (), u64, Platform), context: *const (), args: &[u64], _near: bool) {
                 let mut waiting = self.waiting.lock().unwrap();
                 assert!(waiting.len() + args.len() <= self.actions, "more actions than the Source was made for");
                 waiting.extend(args.iter().map(|&arg| (run, context as usize, arg)));
@@ -531,13 +552,17 @@ fn a_pipeline_after_another_reuses_its_storage_soundly() {
 fn a_room_outlives_its_pipeline() {
     check(|| {
         with_workers(1, || {
-            let first = Pipeline::<usize, ()>::new(Mode::Plain, Limits { messages: 2, rooms: 2 });
-            let mut first = first;
-            let mut held = block_on(first.room());
+            let mut first = Pipeline::<usize, ()>::new(Mode::Plain, Limits { messages: 2, rooms: 2 });
+            let mut held_after = block_on(first.room());
+            let mut held_race = block_on(first.room());
+            let racer = thread::spawn(move || {
+                held_race.bytes_mut().fill(0x5a);
+                drop(held_race);
+            });
             drop(first);
             let giver = thread::spawn(move || {
-                held.bytes_mut().fill(0xa5);
-                drop(held);
+                held_after.bytes_mut().fill(0xa5);
+                drop(held_after);
             });
             let others: Vec<_> = (0..2u8)
                 .map(|which| {
@@ -550,6 +575,7 @@ fn a_room_outlives_its_pipeline() {
                     })
                 })
                 .collect();
+            racer.join().unwrap();
             giver.join().unwrap();
             for other in others {
                 other.join().unwrap();

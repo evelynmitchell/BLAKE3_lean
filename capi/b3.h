@@ -35,7 +35,7 @@
  * built and a dirty tree's Git tree id), so a program can check that the
  * two agree.
  */
-#define B3_VERSION "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+#define B3_VERSION "0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc"
 #ifndef B3_H
 #define B3_H
 
@@ -107,7 +107,9 @@ typedef struct {
 
 void b3_hasher_new(b3_hasher *hasher, const b3_mode *mode, int has_length_hint, uint64_t length_hint);
 
-/* Add the message's next `len` bytes. */
+/* Add the message's next `len` bytes. BLAKE3 messages hold at most
+ * 2^64 - 1 bytes in total; an update that would exceed that limit stops
+ * the process. */
 void b3_hasher_update(b3_hasher *hasher, const void *input, size_t len);
 
 /* The digest of the message so far. The hasher is left as it was: more

@@ -20,7 +20,7 @@ pub(crate) const PIECE: usize = 2 << 20;
 /// is read directly.
 pub(crate) const DIRECT_MIN: u64 = 2 * PIECE as u64;
 
-/// A buffer a direct read can fill: PIECE bytes, on a page boundary.
+/// A buffer a direct read can fill: PIECE bytes, 4096-byte aligned.
 pub(crate) struct Piece(*mut u8);
 
 // Sound: the buffer is the Piece's own.
@@ -98,6 +98,10 @@ pub(crate) fn read<T: Send>(
 ) -> Option<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
+    assert!(per > 0, "direct::read requires at least one output slot per piece");
+    let expected_pieces = len.div_ceil(PIECE);
+    assert!(expected_pieces > 0, "direct::read requires a non-empty length");
+    assert_eq!(outs.chunks_mut(per).len(), expected_pieces, "direct::read output slice must cover every piece");
     let opened = file;
     // Open a new description of this very file, with independent flags and
     // offset. Reopening its old pathname could hash a different file after
@@ -212,7 +216,7 @@ mod test {
     #[test]
     fn a_file_read_directly_hashes_as_its_bytes_do() {
         blake3::initialize();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempfile::tempdir().unwrap();
         let all: Vec<u8> = (0..7 * PIECE + 12345).map(|i: usize| (i.wrapping_mul(37) ^ (i >> 11)) as u8).collect();
         let key = [0x33u8; 32];
         let mut piece = Piece::new();
@@ -256,7 +260,7 @@ mod test {
         if crate::threads().get() == 1 {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempfile::tempdir().unwrap();
         let path = dir.path().join("input");
         let original = vec![0x35u8; DIRECT_MIN as usize];
         std::fs::write(&path, &original).unwrap();
@@ -280,7 +284,7 @@ mod test {
     #[test]
     fn the_one_file_path_reads_a_cold_long_file_directly() {
         blake3::initialize();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempfile::tempdir().unwrap();
         let all: Vec<u8> = (0..DIRECT_MIN as usize + 4096).map(|i: usize| (i.wrapping_mul(41) ^ (i >> 9)) as u8).collect();
         let probe = dir.path().join("probe");
         std::fs::write(&probe, &all[..4096]).unwrap();
@@ -293,7 +297,11 @@ mod test {
             std::fs::write(&path, &all[..len]).unwrap();
             let args = crate::Args::for_test_plain(vec![path.clone()]);
             HASHED.with(|h| h.set(0));
-            assert_eq!(crate::hash_path_hash(&args, &path).unwrap(), blake3::convenience::hash(&all[..len]), "len={len}");
+            assert_eq!(
+                crate::hash_path_hash(&args, &path, &crate::file_end::StdinContext::current(), None).unwrap(),
+                blake3::convenience::hash(&all[..len]),
+                "len={len}"
+            );
             assert_eq!(HASHED.with(|h| h.get()), direct, "len={len}");
         }
         crate::linux_pipe::set_force_miss(false);

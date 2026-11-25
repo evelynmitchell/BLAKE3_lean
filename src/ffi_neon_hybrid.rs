@@ -100,9 +100,16 @@ mod asm {
         pub fn blake3_servil_hybrid_p5(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
         pub fn blake3_servil_hybrid_p7(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
         pub fn blake3_servil_hybrid_p9(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        /// l<n>: p<n> with each lane's last block read from `lasts[i]` and
-        /// recording `lens[i]` bytes (0..=64), in place of its input's last
-        /// block and the packed length (#247).
+        pub fn blake3_servil_hybrid_p4(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
+        pub fn blake3_servil_hybrid_p8(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
+    }
+    // l<n>: p<n> with each lane's last block read from `lasts[i]` and
+    // recording `lens[i]` bytes (0..=64), in place of its input's last
+    // block and the packed length (#247). The only production caller of
+    // `hash_last_lanes` is the std-only `each` module; its direct lane
+    // test also requires `std`.
+    #[cfg(feature = "std")]
+    unsafe extern "C" {
         pub fn blake3_servil_hybrid_l2(
             inputs: *const *const u8,
             blocks: u64,
@@ -173,8 +180,6 @@ mod asm {
             lens: *const u32,
             lasts: *const *const u8,
         );
-        pub fn blake3_servil_hybrid_p4(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
-        pub fn blake3_servil_hybrid_p8(inputs: *const *const u8, blocks: u64, key: *const u32, counter: u64, packed_flags: u64, out: *mut u8);
     }
     /// The kernels on scalars and quads alone, which need no SHA-3.
     macro_rules! plain {
@@ -276,8 +281,12 @@ const CHUNK_KERNELS: [Option<Kernel>; 11] = [
 const CHUNK_PLANS: [&[usize]; 17] =
     [&[], &[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9], &[10], &[8, 3], &[9, 3], &[10, 3], &[10, 4], &[10, 5], &[10, 6]];
 
-/// Parent kernel per exact input count.
-const PARENT_KERNELS: [Option<Kernel>; 10] = [
+/// Parent kernel per exact input count on SHA-3 cores. Zero-spill sequential
+/// scalars (#523) let `pn10` (8+2) win without extra stack spills; 6 single-block
+/// messages stay on `[3, 3]` (`p3 + p3` uses SHA-3 `eor3` with independent
+/// registers, whereas `pn6` serialized its two scalar lanes on Apple M6 and
+/// slowed `ManyMessages|6` by +55.6%). `pn6` stays active in `PLAIN` (no SHA-3).
+const PARENT_KERNELS: [Option<Kernel>; 11] = [
     None,
     Some(asm::blake3_servil_hybrid_k1),
     Some(asm::blake3_servil_hybrid_p2),
@@ -288,11 +297,14 @@ const PARENT_KERNELS: [Option<Kernel>; 10] = [
     Some(asm::blake3_servil_hybrid_p7),
     Some(asm::blake3_servil_hybrid_p8),
     Some(asm::blake3_servil_hybrid_p9),
+    Some(asm::blake3_servil_hybrid_pn10),
 ];
 
 /// The l kernels (#247), per exact input count, beside the parent plans
 /// they share: a lone item runs c1, which takes its last block apart too.
+#[cfg(feature = "std")]
 type LastKernel = unsafe extern "C" fn(*const *const u8, u64, *const u32, u64, u64, *mut u8, *const u32, *const *const u8);
+#[cfg(feature = "std")]
 const LAST_KERNELS: [Option<LastKernel>; 10] = [
     None,
     None,
@@ -306,21 +318,17 @@ const LAST_KERNELS: [Option<LastKernel>; 10] = [
     Some(asm::blake3_servil_hybrid_l9),
 ];
 
-/// Kernel sizes per parent count 1..=16. p3, p5, p7, and p9 hash one
-/// block on the integer units beside the NEON ones, as k3, k5, k7, and k9
-/// do for chunks. Against the binary decomposition over p2, p4, p8, and k1
-/// run one after another, cycles per call on an M4 Max P-core / E-core
-/// (probe/mixed-parents, jobs 121-122): 3 messages -37% / -38%, 5 -27 /
-/// -27, 6 (p3 + p3) -25 / -11, 7 -31 / -34, 9 -18 / -22, 10 (p7 + p3;
-/// p9 + k1 -10 / +1, p5 + p5 -8 / -2) -11 / -8, 11 -13 / -18, 12 -15 / -9,
-/// 13 -12 / -15, 14 -17 / -12, 15 -18 / -19; on the VM 6-39% faster. 2,
-/// 4, 8, and 16 keep their kernels; 13-16 were level with the other
-/// plans tried on the VM. Two scalar lanes stay out: E-cores pay for a
-/// second one what P-cores save. The exception is p4 itself (Zooko,
-/// September 27, 2026): hash_many is built for top speed, P-cores do most
-/// of this machine's work, and four messages were the last batch where
-/// BLAKE3 official led (P -12%, E +30% in cycles per call).
+/// Kernel sizes per parent count 1..=16 on SHA-3 cores. p3, p5, p7, and p9
+/// hash one block on the integer units beside the NEON ones; pn10 (8+2) adds
+/// two zero-spill sequential scalar lanes (#523) without extra stack spills,
+/// so counts 10 and 12..=16 dispatch pn10 while 6 keeps `[3, 3]` (p3 + p3,
+/// SHA-3 `eor3` with independent registers) and 16 uses `[10, 3, 3]`.
 const PARENT_PLANS: [&[usize]; 17] =
+    [&[], &[1], &[2], &[3], &[4], &[5], &[3, 3], &[7], &[8], &[9], &[10], &[9, 2], &[10, 2], &[10, 3], &[10, 4], &[10, 5], &[10, 3, 3]];
+
+/// Kernel sizes for the `l` kernels (`l2..l9`, which have no `l6` or `l10`).
+#[cfg(feature = "std")]
+const LAST_PLANS: [&[usize]; 17] =
     [&[], &[1], &[2], &[3], &[4], &[5], &[3, 3], &[7], &[8], &[9], &[7, 3], &[9, 2], &[9, 3], &[9, 4], &[9, 5], &[8, 7], &[8, 8]];
 
 /// The kernels without SHA-3 per exact input count: scalars and quads
@@ -426,6 +434,7 @@ mod ends {
         pub static blake3_servil_hybrid_p7_end: u8;
         pub static blake3_servil_hybrid_p8_end: u8;
         pub static blake3_servil_hybrid_p9_end: u8;
+        pub static blake3_servil_hybrid_pn10_end: u8;
         pub static blake3_servil_hybrid_k1_end: u8;
         pub static blake3_servil_hybrid_k2_end: u8;
         pub static blake3_servil_hybrid_k3_end: u8;
@@ -521,17 +530,18 @@ fn parent_code(n: usize) -> (usize, usize) {
         7 => code!(blake3_servil_hybrid_p7, blake3_servil_hybrid_p7_end),
         8 => code!(blake3_servil_hybrid_p8, blake3_servil_hybrid_p8_end),
         9 => code!(blake3_servil_hybrid_p9, blake3_servil_hybrid_p9_end),
+        10 => code!(blake3_servil_hybrid_pn10, blake3_servil_hybrid_pn10_end),
         _ => unreachable!("no parent kernel for {n} parents"),
     }
 }
 
 #[cfg(feature = "std")]
-/// Prefetch the code a tree of `whole` chunks and then `partial` bytes
-/// (under a chunk) runs on the hybrids: the chunk kernels
+/// Prefetch the code a tree of `whole` chunks (up to 16) and then `partial`
+/// bytes (under a chunk) runs on the hybrids: the chunk kernels
 /// (`compress_chunks_parallel` and [`hash_chunks_with_partial`] choose
-/// them from the same plans), then [`prefetch_parent_code`]. Requires 1 to
-/// 16 whole chunks.
-pub fn prefetch_tree_code(whole: usize, partial: usize) {
+/// them from the same plans), then [`prefetch_parent_code`] once for
+/// `parent_values` chaining values (clamped to `2..=32`).
+pub fn prefetch_tree_code(whole: usize, partial: usize, parent_values: usize) {
     if partial > 0 && partial_pays(whole, partial) {
         let lead = whole.saturating_sub(9);
         for &n in family().chunk_plans[lead] {
@@ -543,7 +553,7 @@ pub fn prefetch_tree_code(whole: usize, partial: usize) {
             crate::platform::prefetch_code(chunk_code(n, false));
         }
     }
-    prefetch_parent_code(whole + usize::from(partial > 0));
+    prefetch_parent_code(parent_values.min(32));
 }
 
 #[cfg(feature = "std")]
@@ -617,12 +627,18 @@ fn read_apple_cores() -> bool {
 /// where the kernel lets a program read the register.
 #[cfg(all(not(target_vendor = "apple"), target_os = "linux"))]
 fn midr_implementer() -> Option<u8> {
+    use core::ffi::c_ulong;
+    #[cfg_attr(all(target_env = "musl", target_feature = "crt-static"), link(name = "c", kind = "static", modifiers = "-bundle"))]
+    #[cfg_attr(not(all(target_env = "musl", target_feature = "crt-static")), link(name = "c"))]
+    unsafe extern "C" {
+        fn getauxval(kind: c_ulong) -> c_ulong;
+    }
     {
         // AT_HWCAP from <elf.h>, HWCAP_CPUID from <asm/hwcap.h>.
-        const AT_HWCAP: libc::c_ulong = 16;
-        const HWCAP_CPUID: libc::c_ulong = 1 << 11;
+        const AT_HWCAP: c_ulong = 16;
+        const HWCAP_CPUID: c_ulong = 1 << 11;
         // Sound: getauxval reads the process's own vector.
-        if unsafe { libc::getauxval(AT_HWCAP) } & HWCAP_CPUID == 0 {
+        if unsafe { getauxval(AT_HWCAP) } & HWCAP_CPUID == 0 {
             return None;
         }
         let midr: u64;
@@ -662,6 +678,7 @@ pub unsafe fn compress_blocks(cv: &mut CVWords, blocks: *const u8, count: usize,
     // at its end, so `cv` serves as both: the output words land in place,
     // in the little-endian layout CVWords has on this target.
     let cv_ptr = cv.as_mut_ptr();
+    // Sound: caller guarantees `count` in 1..=16 and `count * BLOCK_LEN` readable bytes at `blocks`; `cv` is valid for in-place read/write.
     unsafe {
         let last = blocks.add((count - 1) * BLOCK_LEN);
         crate::ran_kernel(asm::blake3_servil_hybrid_c1 as *const ());
@@ -687,7 +704,7 @@ pub fn compress_in_place(cv: &mut CVWords, block: &[u8; BLOCK_LEN], block_len: u
     let packed = flags as u64 | (block_len as u64) << 24;
     // `cv` is key and output at once; see compress_blocks.
     let cv_ptr = cv.as_mut_ptr();
-    // Safe: the block is 64 readable bytes and the count is 1.
+    // Sound: `block` is 64 readable bytes, count is 1, and `cv` is valid for in-place read/write.
     unsafe {
         let block = block.as_ptr();
         crate::ran_kernel(asm::blake3_servil_hybrid_c1 as *const ());
@@ -722,6 +739,7 @@ pub unsafe fn hash_chunk(
     debug_assert!((1..=16).contains(&blocks));
     debug_assert!(last_len as usize <= BLOCK_LEN);
     let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (last_len as u64) << 24;
+    // Sound: caller guarantees `(blocks - 1) * 64` readable bytes at `input` and `blocks` in 1..=16; `last`, `key`, and `out` are valid references.
     unsafe {
         crate::ran_kernel(asm::blake3_servil_hybrid_c1 as *const ());
         asm::blake3_servil_hybrid_c1(input, blocks as u64, key.as_ptr(), counter, packed, out.as_mut_ptr(), last.as_ptr());
@@ -827,6 +845,7 @@ pub unsafe fn hash_chunks_with_partial(
     let lead = chunks.len().saturating_sub(9);
     if lead > 0 {
         let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (BLOCK_LEN as u64) << 24;
+        // Sound: `lead <= chunks.len()`, each chunk is 1024 readable bytes, and `out` was asserted large enough for `chunks.len() + 1` digests.
         unsafe {
             run_plan(CHUNK_PLANS[lead], &CHUNK_KERNELS, chunks.as_ptr() as *const *const u8, CHUNK_LEN / BLOCK_LEN, key, counter, 1, packed, out);
         }
@@ -845,6 +864,7 @@ pub unsafe fn hash_chunks_with_partial(
         let table = [chunks[0].as_ptr(), padded.as_ptr(), chunks[0].as_ptr()];
         let mut cvs = [0u8; 3 * OUT_LEN];
         let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (BLOCK_LEN as u64) << 24;
+        // Sound: `table` points to 3 valid 1024-byte buffers, `cvs` holds 3 digests, and `q1` was selected after SHA-3 detection.
         unsafe {
             kernel(table.as_ptr(), (CHUNK_LEN / BLOCK_LEN) as u64, key.as_ptr(), counter, packed, cvs.as_mut_ptr(), blocks as u64 | (last_len as u64) << 8);
         }
@@ -863,6 +883,7 @@ pub unsafe fn hash_chunks_with_partial(
     }
     table[n] = padded.as_ptr();
     let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (BLOCK_LEN as u64) << 24;
+    // Sound: `table[..=n]` holds valid 1024-byte buffers (`n` whole chunks + padded partial) and `out` has room for `n + 1` digests.
     unsafe {
         kernel(table.as_ptr(), (CHUNK_LEN / BLOCK_LEN) as u64, key.as_ptr(), counter, packed, out.as_mut_ptr(), blocks as u64 | (last_len as u64) << 8);
     }
@@ -884,6 +905,7 @@ unsafe fn run_plan(
     for &size in plan {
         let kernel = kernels[size].expect("plan names an existing kernel");
         crate::ran_kernel(kernel as *const ());
+        // Sound: caller guarantees `inputs` has `plan.sum()` valid `blocks`-block pointers and `out` has matching `OUT_LEN` room.
         unsafe {
             kernel(inputs.add(done), blocks as u64, key.as_ptr(), counter + done as u64 * counter_step, packed_flags, out[done * OUT_LEN..].as_mut_ptr());
         }
@@ -908,6 +930,7 @@ pub unsafe fn hash_many<const N: usize>(
     flags_end: u8,
     out: &mut [u8],
 ) {
+    // Sound: caller verified NEON support; forwarding valid slices with full-block `last_len = BLOCK_LEN`.
     unsafe { hash_many_last_len(inputs, key, counter, increment_counter, flags, flags_start, flags_end, BLOCK_LEN, out) }
 }
 
@@ -926,6 +949,7 @@ pub unsafe fn hash_many_last_len<const N: usize>(
     last_len: usize,
     out: &mut [u8],
 ) {
+    // Sound: caller verified NEON support; `family()` selects only kernels supported by this CPU.
     unsafe { hash_many_in(family(), inputs, key, counter, increment_counter, flags, flags_start, flags_end, last_len, out) }
 }
 
@@ -943,7 +967,7 @@ unsafe fn hash_many_in<const N: usize>(
     last_len: usize,
     out: &mut [u8],
 ) {
-    assert!(out.len() >= inputs.len() * OUT_LEN);
+    assert!(inputs.len() <= out.len() / OUT_LEN);
     assert!((1..=BLOCK_LEN).contains(&last_len), "a last block of 1 to 64 bytes");
     const { assert!(N > 0 && N % BLOCK_LEN == 0 && N <= CHUNK_LEN, "1 to 16 whole blocks") };
     let (plans, kernels, counter_step): (&[&[usize]; 17], &[Option<Kernel>], u64) = if increment_counter.yes() {
@@ -960,6 +984,7 @@ unsafe fn hash_many_in<const N: usize>(
     let mut done = 0;
     while done < inputs.len() {
         let count = core::cmp::min(GROUP, inputs.len() - done);
+        // Sound: `done + count <= inputs.len()`, `inputs` holds valid `N`-byte references, and `out` was asserted to hold `inputs.len() * OUT_LEN` bytes.
         unsafe {
             run_plan(
                 plans[count],
@@ -997,14 +1022,15 @@ pub unsafe fn hash_messages_raw(
     last_len: usize,
     out: &mut [u8],
 ) {
-    assert!((1..=GROUP).contains(&count) && out.len() >= count * OUT_LEN, "1 to GROUP inputs, room for every digest");
+    assert!((1..=GROUP).contains(&count) && count <= out.len() / OUT_LEN, "1 to GROUP inputs, room for every digest");
     assert!((1..=16).contains(&blocks) && (1..=BLOCK_LEN).contains(&last_len), "1 to 16 blocks, the last of 1 to 64 bytes");
     let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | (last_len as u64) << 24;
     let family = family();
+    // Sound: caller verified NEON and `count` valid `blocks`-block pointers in `table`; `out` was asserted to hold `count * OUT_LEN` bytes.
     unsafe { run_plan(family.parent_plans[count], family.parent_kernels, table, blocks, key, counter, 0, packed, out) };
 }
 
-/// Up to GROUP items of `blocks` blocks each (1 to 16) at counter 0, side
+/// Up to GROUP items of `blocks` blocks each (1 to 16) at `counter`, side
 /// by side, each item's last block its own: read from `lasts[i]` (64
 /// bytes, zero past `lens[i]`, which is 0 to 64) in place of its input's,
 /// and recording `lens[i]` bytes. `flags` on every block, `flags_start` on
@@ -1015,6 +1041,7 @@ pub unsafe fn hash_messages_raw(
 /// Unsafe because the CPU must have NEON and SHA-3 (`sha3_detected`), each
 /// input must reach `blocks - 1` whole blocks, and each last block 64 bytes.
 /// The output must be separate from every input prefix and last block.
+#[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn hash_last_lanes(
     inputs: &[*const u8],
@@ -1022,6 +1049,7 @@ pub unsafe fn hash_last_lanes(
     lens: &[u32],
     blocks: usize,
     key: &CVWords,
+    counter: u64,
     flags: u8,
     flags_start: u8,
     flags_end: u8,
@@ -1029,19 +1057,19 @@ pub unsafe fn hash_last_lanes(
 ) {
     let count = inputs.len();
     assert!(count >= 1 && count <= GROUP && lasts.len() == count && lens.len() == count, "1 to GROUP items, a last block and a length each");
-    assert!((1..=16).contains(&blocks) && lens.iter().all(|&l| l <= BLOCK_LEN as u32), "1 to 16 blocks, the last of 0 to 64 bytes");
+    assert!((1..=16).contains(&blocks) && lens.iter().all(|&l| l <= u32::try_from(BLOCK_LEN).unwrap()), "1 to 16 blocks, the last of 0 to 64 bytes");
     assert!(out.len() >= count * OUT_LEN, "room for every digest");
     let packed = flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16;
     if count == 1 {
         // Sound: the caller's contract; c1 reads its last block from `last`.
         unsafe {
             crate::ran_kernel(asm::blake3_servil_hybrid_c1 as *const ());
-            asm::blake3_servil_hybrid_c1(inputs[0], blocks as u64, key.as_ptr(), 0, packed | (lens[0] as u64) << 24, out.as_mut_ptr(), lasts[0]);
+            asm::blake3_servil_hybrid_c1(inputs[0], blocks as u64, key.as_ptr(), counter, packed | (lens[0] as u64) << 24, out.as_mut_ptr(), lasts[0]);
         }
         return;
     }
     let mut done = 0;
-    for &size in PARENT_PLANS[count] {
+    for &size in LAST_PLANS[count] {
         let kernel = LAST_KERNELS[size].expect("an l kernel for every size a plan of two or more names");
         // Sound: the caller's contract, for items done..done + size.
         unsafe {
@@ -1050,7 +1078,7 @@ pub unsafe fn hash_last_lanes(
                 inputs.as_ptr().add(done),
                 blocks as u64,
                 key.as_ptr(),
-                0,
+                counter,
                 packed,
                 out[done * OUT_LEN..].as_mut_ptr(),
                 lens.as_ptr().add(done),
@@ -1105,10 +1133,23 @@ mod test {
                     let end = crate::CHUNK_END | crate::ROOT;
                     // Sound: SHA-3 is present; each input holds blocks - 1 whole
                     // blocks before its last, and each last block 64 bytes.
-                    unsafe { hash_last_lanes(&inputs, &lasts, &last_lens, blocks, &key, flags, crate::CHUNK_START, end, &mut out) };
+                    unsafe { hash_last_lanes(&inputs, &lasts, &last_lens, blocks, &key, 0, flags, crate::CHUNK_START, end, &mut out) };
                     for (i, item) in items.iter().enumerate() {
                         let want = crate::convenience::hash_with(mode, item);
                         assert_eq!(&out[i * OUT_LEN..][..OUT_LEN], want.as_bytes(), "{count} items of {blocks} blocks, item {i} of {} bytes", item.len());
+                    }
+                    // Also check non-zero 64-bit counter with non-root CHUNK_END (partial last chunks in hash_each).
+                    let counter = if blocks % 2 == 0 { 0x0000_0001_ffff_fffeu64 + count as u64 } else { blocks as u64 };
+                    // Sound: SHA-3 is present; same validated inputs and outputs.
+                    unsafe { hash_last_lanes(&inputs, &lasts, &last_lens, blocks, &key, counter, flags, crate::CHUNK_START, crate::CHUNK_END, &mut out) };
+                    for (i, item) in items.iter().enumerate() {
+                        let want = crate::hasher::ChunkState::new(&key, counter, flags, crate::platform::Platform::NEON).update(item).output().chaining_value();
+                        assert_eq!(
+                            &out[i * OUT_LEN..][..OUT_LEN],
+                            &want,
+                            "counter={counter:#x} {count} items of {blocks} blocks, item {i} of {} bytes",
+                            item.len()
+                        );
                     }
                 }
             }
@@ -1267,7 +1308,7 @@ mod test {
         if sha3_detected() {
             for whole in 1..=16 {
                 for partial in [0, 1, 63, 64, 65, 500, 1023] {
-                    prefetch_tree_code(whole, if whole == 16 { 0 } else { partial });
+                    prefetch_tree_code(whole, if whole == 16 { 0 } else { partial }, whole + usize::from(partial > 0));
                 }
             }
         }

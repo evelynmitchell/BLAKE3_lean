@@ -1,6 +1,6 @@
 [package]
 name = "blake3-servil-c"
-version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+version = "0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc"
 description = "BLAKE3, BLAKE3-Servil's C API (b3.h)"
 edition = "2024"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
@@ -35,8 +35,20 @@ name = "b3_servil"
 filename = "b3_servil"
 
 [dev-dependencies]
-serde_json = "1"
 libc = "0.2"
 
 [profile.release]
 panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+style = { level = "allow", priority = -1 }
+perf = { level = "allow", priority = -1 }
+cast_possible_truncation = "deny"

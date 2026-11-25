@@ -72,24 +72,27 @@
 //! The [`Hasher`] runs on the calling thread; its
 //! first update is treated as a call now and then (its code fetched first
 //! where that helps), and its later updates as call after call. The
-//! throughput call that takes it, [`throughput::update_each`], is tuned
-//! as a throughput call.
+//! throughput call that takes it, `throughput::update_each` (with `std`),
+//! is tuned as a throughput call.
 //!
 //! Start with the convenience calls; when a program needs more speed, it
 //! moves to the throughput ones.
 //!
 //! | Your data | Call |
 //! |---|---|
-//! | One message in memory | [`convenience::hash`], or for call after call [`throughput::hash`] |
+//! | One message in memory (now and then) | [`convenience::hash`] (or [`convenience::hash_with`]) |
+//! | One message in memory, repeated call after call | [`throughput::hash`] (on aligned [`Block`](throughput::Block)s), or [`throughput::TreeHasher::hash`] directly on caller-owned `&[u8]` slices without copying into aligned blocks |
 //! | One message arriving in pieces | [`convenience::Hasher`] |
-//! | Many messages of one length, in one buffer | [`throughput::hash_many`] |
-//! | Many 16- or 32-byte messages (a Merkle layer's leaves or digests) | [`throughput::hash_many`] over a [`throughput::Packed`] |
-//! | Many messages of different lengths, in memory | [`throughput::hash_each`] |
-//! | Many messages arriving at once (a server's uploads) | [`throughput::update_each`], then [`throughput::finalize_each`] |
+//! | Many messages of one length, in one buffer | [`throughput::hash_many`] over a [`throughput::Batch`] |
+//! | Many 16- or 32-byte messages (a Merkle layer's leaves or digests) | With `std`, [`throughput::hash_many`] over a [`throughput::Batch`] (fastest for already-prepared batches) or `throughput::Packed` (compact storage; expands on the stack internally, avoids refill copies in chains). Without `std`, a prepared [`throughput::TreeHasher`] per message. |
+//! | Many messages of different lengths, in memory | `throughput::hash_each` (with `std`) |
+//! | Many messages arriving at once (a server's uploads) | `throughput::update_each`, then `throughput::finalize_each` (with `std`) |
 //!
 //! Each call returns once its hash is done, on the calling thread. For
 //! long inputs and large batches on several cores, the crate
-//! `blake3-servil` adds a multithreaded form of each.
+//! `blake3-servil` adds a multithreaded form of each, and for messages
+//! that keep arriving its Pipeline
+//! (`throughput::update_each` says when each is the one to use).
 //!
 //! Short messages hash fastest together: 1024 messages of 64 bytes in one
 //! [`throughput::hash_many`] call take about a fifth of the time of 1024
@@ -132,19 +135,31 @@
 //! # Memory
 //!
 //! - **A [`Hasher`] is 26 KiB**; box it where that matters.
-//! - **These single-threaded calls allocate nothing**: [`convenience::hash`],
-//!   [`throughput::hash`], [`throughput::hash_many`], [`Hasher::update`](convenience::Hasher::update)
-//!   and [`Hasher::finalize`](convenience::Hasher::finalize), and [`OutputReader`].
-//!   [`Hasher::update_reader`](convenience::Hasher::update_reader) uses a 1 MiB buffer while it reads past
-//!   64 KiB, freed when it returns. [`throughput::hash_each`] keeps, on the
-//!   thread that calls it, 32 bytes for each chunk of the collection's
-//!   messages of 2 to 15 chunks and 16 for each such message: its first
-//!   collection and a larger one grow that storage, and a repeated
-//!   collection allocates nothing.
+//! - **These single-threaded calls allocate nothing** (except on 512-bit SME2
+//!   CPUs under `std`, where the first flat-walk tree of 32 KiB or more on
+//!   each thread lazily allocates one reusable 64 KiB thread-local scratch
+//!   block; without `std`, or during thread-local teardown after that block is
+//!   destroyed, that 64 KiB scratch sits on the stack instead):
+//!   [`convenience::hash`], [`throughput::hash`], [`throughput::hash_many`],
+//!   [`Hasher::update`](convenience::Hasher::update) and
+//!   [`Hasher::finalize`](convenience::Hasher::finalize), and [`OutputReader`].
+//!   With `std`, `Hasher::update_reader` uses a 64 KiB stack buffer for the
+//!   first read (even on immediate EOF), and promotes to a 1 MiB heap buffer
+//!   once 65,536 bytes or more are read before EOF, freed when it returns.
+//!   `throughput::hash_each` (with `std`) keeps reusable per-thread `Vec`
+//!   storage for messages of 2 to 15 chunks (16 bytes per message and 32 bytes
+//!   per chunk of payload, plus `Vec` capacity): its first such collection and
+//!   a larger one grow that storage, and a repeated collection on a live
+//!   thread allocates nothing; during thread-local teardown after that storage
+//!   is destroyed, a collection with multi-chunk items falls back to
+//!   call-local `Vec`s.
 //! - **Grouped incremental calls** use bounded stack tables and tree buffers.
-//!   [`throughput::update_each`] allocates and frees nothing.
-//! - **Once per process**: the startup self-test's buffers, about 45 KiB
-//!   of the calling thread's stack while it runs (it allocates nothing).
+//!   `throughput::update_each` (with `std`) allocates and frees nothing beyond
+//!   the one-time per-thread SME2 flat-walk scratch noted above if a fresh
+//!   thread hashes a whole 32 KiB+ piece on a 512-bit SME2 CPU.
+//! - **Once per process**: the startup self-test's buffers on the calling
+//!   thread's stack while it runs (plus the SME2 flat-walk scratch noted above
+//!   on 512-bit SME2 CPUs).
 //! - **Nothing is wiped**: this crate does not clear what it held from
 //!   memory, and offers no call that does. A key, the message bytes a
 //!   [`Hasher`] holds and the chaining values made from them stay in the
@@ -161,37 +176,44 @@
 //!
 //! # Startup self-test
 //!
-//! **Every program calls [`initialize`] once, before any other call of
-//! this crate**: a call before it panics, in every build, saying so. The
-//! check costs nothing: it is part of the platform load every call makes.
+//! **Every program calls [`initialize`] once, before hashing**: any call
+//! that loads the detected platform (including [`convenience::hash`],
+//! [`Hasher::new`](convenience::Hasher::new), `Mode::DeriveKey` context
+//! hashing, and hashing methods on [`TreeHasher`](throughput::TreeHasher))
+//! panics before `initialize` completes, in every build, saying so. Pure
+//! constructors and `const` coordinate helpers that need no runtime platform
+//! (such as [`TreeHasher::new`](throughput::TreeHasher::new) for `Plain`,
+//! `Keyed`, or `DeriveKeyWith`, an empty `parent_cvs` call, and
+//! [`throughput::left_len`]) do not load the platform. The check costs
+//! nothing: it is part of the platform load made when selecting kernels.
 //!
 //! `initialize` checks the build and the CPU before the process first
 //! hashes, in well under a millisecond. It runs the assembly kernels built
 //! for this machine on fixed inputs and compares the outputs with fixed
 //! values official BLAKE3 generated (on ARM64, all but the kernels for
 //! batches of short messages of unequal lengths). A mismatch stops the process, which no
-//! caller can catch: with `std` it names the code path on stderr and
-//! aborts; without it, the CPU's trap instruction stops it. Other threads
-//! that call `initialize` meanwhile wait for it.
+//! caller can catch: with `std` it writes a best-effort diagnostic directly to
+//! file descriptor 2 (bypassing Rust's stderr lock and skipping an
+//! already-full pipe) and aborts; without it, the CPU's trap instruction stops
+//! it. Other threads that call `initialize` meanwhile wait for it (parked via
+//! `std::sync::Once` under `std`; spinning without `std`, so `no_std` programs
+//! with strict fixed-priority scheduling should call `initialize` before
+//! starting higher-priority callers, and programs that `fork` should finish
+//! `initialize` before forking).
 //!
 //! # Cargo Features
 //!
 //! The `std` feature (the only feature enabled by default) enables the
-//! [`Write`] implementation and the [`update_reader`](convenience::Hasher::update_reader)
-//! method for [`Hasher`], and also the [`Read`] and [`Seek`] implementations
-//! for [`OutputReader`].
+//! [`Write`] implementation and `Hasher::update_reader` for [`Hasher`],
+//! the [`Read`] and [`Seek`] implementations for [`OutputReader`], owned
+//! `Batch`/`Packed` builders, and the `hash_each`/`update_each` calls.
 //!
-//! The build needs a C compiler that assembles the kernels (GCC 12 or
-//! later, or Clang); without one it stops and says so. This crate runs its
-//! assembly or not at all: for portable Rust, use official BLAKE3.
-//!
-//! The `serde` feature (off by default, on for [docs.rs]) implements
-//! [`serde::Serialize`](https://docs.rs/serde/latest/serde/trait.Serialize.html) and
-//! [`serde::Deserialize`](https://docs.rs/serde/latest/serde/trait.Deserialize.html)
-//! for [`Hash`](struct@Hash).
+//! All kernels are assembled directly by `rustc` via
+//! `core::arch::global_asm!` (no external C compiler or `cc` build dependency
+//! is required for the Rust libraries). This crate runs its assembly or not at
+//! all: for portable Rust or other targets, use official BLAKE3.
 //!
 //! [BLAKE3]: https://blake3.io
-//! [docs.rs]: https://docs.rs/
 //! [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
 //! [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
 //! [`Seek`]: https://doc.rust-lang.org/std/io/trait.Seek.html
@@ -203,13 +225,17 @@
 #[macro_use]
 extern crate std;
 
+#[cfg(all(test, feature = "std"))]
+mod lifecycle_counts;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
 mod test_support;
 
+mod asm;
 mod block;
 pub mod convenience;
+mod ct;
 #[cfg(feature = "std")]
 mod each;
 pub mod throughput;
@@ -230,6 +256,13 @@ mod avx512_32;
 #[cfg(blake3_sse41_ffi)]
 #[path = "ffi_chunk_root.rs"]
 mod chunk_root;
+mod ffi_counter;
+#[cfg(all(feature = "std", blake3_avx512_ffi, target_os = "linux"))]
+mod ffi_output;
+#[cfg(all(feature = "std", blake3_neon))]
+#[path = "ffi_output_aarch64.rs"]
+mod ffi_output;
+mod ffi_packed;
 #[cfg(blake3_neon)]
 #[path = "ffi_neon_hybrid.rs"]
 mod neon_hybrid;
@@ -238,8 +271,6 @@ mod neon_hybrid;
 mod sme2;
 // Whole chunks and a partial one in one pass, on x86-64 (generated by
 // tools/gen_x86.py, built with the SSE4.1 and AVX2 assembly).
-#[cfg(all(feature = "std", blake3_avx512_ffi, target_os = "linux"))]
-mod ffi_output;
 #[cfg(blake3_sse41_ffi)]
 mod ffi_partial;
 #[cfg(blake3_sse41_ffi)]
@@ -251,6 +282,7 @@ mod io;
 mod many;
 mod pair;
 mod self_test;
+mod stack_vec;
 mod tree;
 
 /// A kind of kernel or path a call ran, for the tests that check which
@@ -278,8 +310,9 @@ pub(crate) enum Ran {
     /// A batch of messages of up to a chunk, two or more, ran on the
     /// kernels' table a run at a time (many::hash_many_on's short path).
     ShortRun = 128,
-    /// Whole chunks or parents were hashed on a wider kernel than their
-    /// count, the spare lanes a copy of the last (rounded_lanes).
+    /// Whole chunks, parents, or x86-64 multi-block batches were hashed on a
+    /// wider kernel than their count, the spare lanes a copy of the last
+    /// (rounded_lanes / round_x86_blocks).
     RoundedUp = 256,
     /// A table's one-block inputs were copied into one buffer for SME2's
     /// parent kernel (sme2::hash_many): a copy of the input that blocks
@@ -295,6 +328,15 @@ std::thread_local! {
     /// The lanes the rounded-up hash_many calls ran at since the test last
     /// cleared it, as a mask of widths (4 | 8 = 12: both).
     pub(crate) static ROUNDED_WIDTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// `(blocks, inputs.len())` recorded at `Platform::hash_many` and
+    /// `pair::hash_many_blocks`, for verifying actual kernel dispatch widths.
+    pub(crate) static KERNEL_HASH_MANY_CALLS: core::cell::RefCell<std::vec::Vec<(usize, usize)>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+}
+
+#[cfg(all(test, feature = "std"))]
+#[inline(always)]
+pub(crate) fn record_hash_many_call(blocks: usize, count: usize) {
+    let _ = KERNEL_HASH_MANY_CALLS.try_with(|v| v.borrow_mut().push((blocks, count)));
 }
 
 /// Note that `kind` happened: in the tests' record, and nothing in any
@@ -303,7 +345,7 @@ std::thread_local! {
 #[allow(dead_code)]
 pub(crate) fn ran(kind: Ran) {
     #[cfg(all(test, feature = "std"))]
-    RAN.with(|r| r.set(r.get() | kind as u32));
+    let _ = RAN.try_with(|r| r.set(r.get() | kind as u32));
     let _ = kind;
 }
 
@@ -321,7 +363,8 @@ pub(crate) enum Counted {
     RootBlock = 1,
     /// One group of short collection items hashed together by blocks.
     ByBlocksCall = 2,
-    /// One AVX-512 finalize_each dispatch turn, requiring a full group.
+    /// One x86-64 AVX-512/AVX2 finalize_each output dispatch turn (four or
+    /// more eligible counter-zero hashers).
     OutputGroupTurn = 3,
     /// One pass of update_each's held groups hashed together.
     HeldPass = 4,
@@ -336,12 +379,17 @@ pub(crate) enum Counted {
     /// One `finalize` that hashed the staged bytes apart and read the
     /// stack, the core not copied.
     TailApart = 8,
+    /// One whole subtree a Hasher's update hashed on SME2's flat walk, to
+    /// its one chaining value (the Hasher's hook `subtree_cv`).
+    Flat = 9,
+    /// One multi-lane SIMD `Platform::hash_many` dispatch call (#497).
+    HashManyCall = 10,
 }
 
 #[cfg(all(test, feature = "std"))]
 std::thread_local! {
     /// This thread's counts since the test last cleared them, by Counted.
-    pub(crate) static COUNTED: [core::cell::Cell<u64>; 9] = const { [const { core::cell::Cell::new(0) }; 9] };
+    pub(crate) static COUNTED: [core::cell::Cell<u64>; 11] = const { [const { core::cell::Cell::new(0) }; 11] };
 }
 
 /// Count one of `what`: in the tests' record, and nothing in any other
@@ -350,7 +398,7 @@ std::thread_local! {
 #[allow(dead_code)]
 pub(crate) fn counted(what: Counted) {
     #[cfg(all(test, feature = "std"))]
-    COUNTED.with(|c| c[what as usize].set(c[what as usize].get() + 1));
+    let _ = COUNTED.try_with(|c| c[what as usize].set(c[what as usize].get() + 1));
     let _ = what;
 }
 
@@ -367,14 +415,14 @@ std::thread_local! {
 #[allow(dead_code)]
 pub(crate) fn ran_kernel(entry: *const ()) {
     #[cfg(all(test, feature = "std"))]
-    RAN_ENTRIES.with(|r| r.borrow_mut().insert(entry as usize));
+    let _ = RAN_ENTRIES.try_with(|r| r.borrow_mut().insert(entry as usize));
     let _ = entry;
 }
 
-use arrayvec::{ArrayString, ArrayVec};
 use core::cmp;
 use core::fmt;
 use platform::{MAX_SIMD_DEGREE, Platform};
+use stack_vec::StackVec;
 
 /// This build's version: the crate's version, and for any build but a
 /// release's own commit, the commit built and, from a dirty tree, the Git
@@ -411,10 +459,8 @@ pub(crate) type CVBytes = [u8; 32]; // little-endian
 
 pub(crate) const IV: &CVWords = &[0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19];
 
-// These are the internal flags that we use to domain separate root/non-root,
-// chunk/parent, and chunk beginning/middle/end. These get set at the high end
-// of the block flags word in the compression function, so their values start
-// high and go down.
+// These are the internal domain-separation flags in the low bits (0 through 6)
+// of the block flags word in the compression function.
 pub(crate) const CHUNK_START: u8 = 1 << 0;
 pub(crate) const CHUNK_END: u8 = 1 << 1;
 const PARENT: u8 = 1 << 2;
@@ -454,9 +500,6 @@ pub(crate) const DERIVE_KEY_MATERIAL: u8 = 1 << 6;
 /// - `Copy` leaves the same digest available at both places.
 /// - `Debug` includes the full digest in hexadecimal, even for a derived
 ///   key.
-/// - `Deserialize` (with `serde`) reads a sequence of exactly 32 bytes (in
-///   JSON an array of 32 numbers, not the hex string) and takes them as
-///   the digest, hashing nothing.
 /// - `Display` prints all 32 bytes in lowercase hexadecimal, even for a
 ///   derived key.
 /// - `Eq` treats digests with identical bytes as equal.
@@ -469,12 +512,112 @@ pub(crate) const DERIVE_KEY_MATERIAL: u8 = 1 << 6;
 ///   depend on those bytes.
 /// - `PartialEq` compares digests, arrays and slices in constant time for
 ///   32-byte operands; a different length is unequal.
-/// - `Serialize` (with `serde`) writes the digest as a sequence of 32 bytes
-///   (in JSON an array of 32 numbers, not a hex string).
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[derive(Clone, Copy, Hash, Eq)]
+#[derive(Clone, Copy, Eq)]
 #[repr(transparent)]
 pub struct Hash([u8; OUT_LEN]);
+
+/// The 64 lowercase hexadecimal characters of a [`Hash`](struct@Hash), held
+/// inline with no heap allocation.
+///
+/// Dereferences to `&str` and implements `Display`, `AsRef<str>`, `AsRef<[u8]>`,
+/// and `PartialEq<&str>` / `PartialEq<str>`. Equality on `HexHash` is not
+/// constant-time; compare [`Hash`](struct@Hash) values directly for secret tags or keys.
+///
+/// # Trait implementations
+///
+/// - `AsRef` borrows the 64 hexadecimal characters as `&str` or `&[u8]`.
+/// - `Borrow` lends the 64 hexadecimal characters as `&str`, with the `str`'s own hash, equality and order, so a map keyed by `HexHash` finds a key by its `&str`.
+/// - `Clone` copies the 64 ASCII bytes.
+/// - `Copy` leaves the same 64 ASCII bytes available at both places.
+/// - `Debug` formats the 64 hexadecimal characters as a quoted Rust string.
+/// - `Deref` borrows the 64 hexadecimal characters as `&str`.
+/// - `Display` formats the 64 lowercase hexadecimal characters as their `str` does, width and precision included.
+/// - `Eq` reflects `PartialEq` over the 64 ASCII bytes (not constant-time).
+/// - `Hash` feeds the hasher what the `str` of the 64 characters feeds it.
+/// - `Ord` compares the 64 ASCII bytes lexicographically (not constant-time).
+/// - `PartialEq` compares the 64 ASCII bytes against another `HexHash`, `str`, or `&str` (not constant-time).
+/// - `PartialOrd` compares the 64 ASCII bytes lexicographically (not constant-time).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HexHash([u8; 2 * OUT_LEN]);
+
+impl HexHash {
+    /// View the 64 hexadecimal characters as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        // Sound: `Hash::to_hex` writes only ASCII '0'..='9' and 'a'..='f'.
+        unsafe { core::str::from_utf8_unchecked(&self.0) }
+    }
+
+    /// View the 64 ASCII hexadecimal bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; 2 * OUT_LEN] {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for HexHash {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for HexHash {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for HexHash {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::borrow::Borrow<str> for HexHash {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+// As the str hashes, which `Borrow<str>` requires: a derived hash of the
+// byte array feeds the hasher other bytes, and a lookup by `&str` misses.
+impl core::hash::Hash for HexHash {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state)
+    }
+}
+
+impl fmt::Display for HexHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Debug for HexHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq<str> for HexHash {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for HexHash {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
 
 impl Hash {
     /// The raw bytes of the `Hash`. Note that byte arrays don't provide
@@ -512,22 +655,20 @@ impl Hash {
     /// call's time and memory accesses are the same for every hash (a
     /// hash may be a secret: a keyed hash's tag, a derived key).
     ///
-    /// The returned [`ArrayString`] is a fixed size and doesn't allocate memory
-    /// on the heap. Note that [`ArrayString`] doesn't provide constant-time
-    /// equality checking, so if you need to compare hashes, prefer the `Hash`
-    /// type.
-    ///
-    /// [`ArrayString`]: https://docs.rs/arrayvec/0.5.1/arrayvec/struct.ArrayString.html
-    pub fn to_hex(&self) -> ArrayString<{ 2 * OUT_LEN }> {
+    /// The returned [`HexHash`] holds the 64 ASCII hexadecimal bytes inline
+    /// with no heap allocation and dereferences to `&str`. Note that
+    /// [`HexHash`] doesn't provide constant-time equality checking, so if you
+    /// need to compare hashes, prefer the [`Hash`](struct@Hash) type.
+    pub fn to_hex(&self) -> HexHash {
         // 0..=9 are '0' + n; 10..=15 are 'a' + n - 10, which is '0' + n + 39:
         // (n + 6) >> 4 is 1 exactly for those.
-        let character = |n: u8| (b'0' + n + ((n + 6) >> 4) * 39) as char;
-        let mut s = ArrayString::new();
-        for &b in self.0.iter() {
-            s.push(character(b >> 4));
-            s.push(character(b & 0xf));
+        let nibble = |n: u8| b'0' + n + ((n + 6) >> 4) * 39;
+        let mut bytes = [0u8; 2 * OUT_LEN];
+        for (i, &b) in self.0.iter().enumerate() {
+            bytes[2 * i] = nibble(b >> 4);
+            bytes[2 * i + 1] = nibble(b & 0xf);
         }
-        s
+        HexHash(bytes)
     }
 
     /// Decode a `Hash` from hexadecimal. Both uppercase and lowercase ASCII
@@ -598,27 +739,38 @@ impl core::str::FromStr for Hash {
     }
 }
 
-/// This implementation is constant-time.
+/// This implementation is constant-time (branchless integer assembly; on Arm
+/// it leaves `PSTATE.DIT` as the calling thread has it, matching hashing).
 impl PartialEq for Hash {
     #[inline]
     fn eq(&self, other: &Hash) -> bool {
-        constant_time_eq::constant_time_eq_32(&self.0, &other.0)
+        ct::eq_32(&self.0, &other.0)
     }
 }
 
-/// This implementation is constant-time.
+impl core::hash::Hash for Hash {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// This implementation is constant-time (branchless integer assembly; on Arm
+/// it leaves `PSTATE.DIT` as the calling thread has it, matching hashing).
 impl PartialEq<[u8; OUT_LEN]> for Hash {
     #[inline]
     fn eq(&self, other: &[u8; OUT_LEN]) -> bool {
-        constant_time_eq::constant_time_eq_32(&self.0, other)
+        ct::eq_32(&self.0, other)
     }
 }
 
-/// This implementation is constant-time if the target is 32 bytes long.
+/// This implementation is constant-time if the target is 32 bytes long
+/// (branchless integer assembly; on Arm it leaves `PSTATE.DIT` as the calling
+/// thread has it, matching hashing).
 impl PartialEq<[u8]> for Hash {
     #[inline]
     fn eq(&self, other: &[u8]) -> bool {
-        constant_time_eq::constant_time_eq(&self.0, other)
+        ct::eq_slice_32(&self.0, other)
     }
 }
 
@@ -626,7 +778,7 @@ impl fmt::Display for Hash {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Formatting field as `&str` to reduce code size since the `Debug`
         // dynamic dispatch table for `&str` is likely needed elsewhere already,
-        // but that for `ArrayString<[u8; 64]>` is not.
+        // but that for `HexHash` is not.
         let hex = self.to_hex();
         let hex: &str = hex.as_str();
 
@@ -638,7 +790,7 @@ impl fmt::Debug for Hash {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Formatting field as `&str` to reduce code size since the `Debug`
         // dynamic dispatch table for `&str` is likely needed elsewhere already,
-        // but that for `ArrayString<[u8; 64]>` is not.
+        // but that for `HexHash` is not.
         let hex = self.to_hex();
         let hex: &str = hex.as_str();
 
@@ -730,20 +882,6 @@ impl hasher::Blocks for Platform {
     }
 }
 
-impl Clone for ChunkState {
-    fn clone(&self) -> Self {
-        hasher::ChunkState {
-            buf: self.buf,
-            cv: self.cv,
-            chunk_counter: self.chunk_counter,
-            buf_len: self.buf_len,
-            blocks_compressed: self.blocks_compressed,
-            flags: self.flags,
-            platform: self.platform,
-        }
-    }
-}
-
 impl ChunkState {
     // Try to avoid buffering as much as possible, by compressing directly from
     // the input slice when full blocks are available (src/hasher.rs).
@@ -775,84 +913,26 @@ impl IncrementCounter {
     }
 }
 
-/// The lanes of the one pass that hashes `whole` whole chunks with a
-/// partial one of `partial` bytes after them, where the pass costs less
-/// than the partial chunk's blocks after the whole ones: one whole chunk
-/// and a partial one of two blocks or more in four lanes (AVX2 and
-/// AVX-512: the chain falls from 25 blocks to 16 at 1536 bytes), three
-/// whole chunks in four lanes (SSE4.1 and AVX2), and in eight (AVX2) six or
-/// seven, or five with a partial chunk of six blocks or more (with fewer,
-/// an i7-12700K's efficiency core ran the eight lanes up to 7% slower; a
-/// pass of eight lanes costs 1.6 times one of four on its performance
-/// core). AVX-512 otherwise keeps its own widths (unmeasured).
-#[cfg(blake3_sse41_ffi)]
-#[inline]
-fn spare_lane(platform: Platform, whole: usize, partial: usize) -> Option<usize> {
-    match (platform, whole) {
-        (Platform::AVX2, 1) if partial > BLOCK_LEN => Some(4),
-        #[cfg(blake3_avx512_ffi)]
-        (Platform::AVX512, 1) if partial > BLOCK_LEN => Some(4),
-        (Platform::SSE41 | Platform::AVX2, 3) => Some(4),
-        (Platform::AVX2, 6..=7) => Some(8),
-        (Platform::AVX2, 5) if partial > 5 * BLOCK_LEN => Some(8),
-        _ => None,
-    }
-}
-
 /// The widths the platform's many-lane kernels run at, in one pass each,
 /// rising: SSE4.1 four lanes; AVX2 eight (and four); AVX-512 sixteen (and
 /// eight, four), and thirty-two where the 32-input kernel runs
 /// (wide_avx512, Zen 5 on Linux). Below the smallest, one and two lanes
 /// have passes of their own as cheap as one.
-fn lane_widths(platform: Platform) -> &'static [usize] {
-    match platform {
-        #[cfg(blake3_sse41_ffi)]
-        Platform::SSE41 => &[4],
-        #[cfg(blake3_avx2_ffi)]
-        Platform::AVX2 => &[4, 8],
-        #[cfg(blake3_avx512_ffi)]
-        Platform::AVX512 => {
-            if cfg!(target_os = "linux") && crate::platform::wide_avx512() {
-                &[4, 8, 16, 32]
-            } else {
-                &[4, 8, 16]
-            }
-        }
-        // The platforms with no many-lane widths here (AArch64's); on
-        // x86-64 with every kernel built, the arms above cover them all.
-        #[allow(unreachable_patterns)]
-        _ => &[],
-    }
-}
-
-/// The lanes `count` whole inputs run on when the kernels' cascade would
-/// take two or more passes for them: on x86 a many-lane kernel hashes its
-/// width at a time, then the next width down, and so on to one, each
-/// pass about as long as a 1-lane pass of the same blocks (i7-12700K,
-/// cycles a block-step from the thread's counts: 1 lane 226, 2 lanes 248,
-/// 4 lanes 338, 8 lanes 516), so 3 inputs cost a 2-pass and a 1-pass
-/// (474) where one 4-lane pass costs 338, and 7 cost 4 + 2 + 1 (812)
-/// where 8 lanes cost 516. The smallest width at or above the count takes
-/// it in one pass, the spare lanes a copy of the last input whose results
-/// are dropped. None for one or two inputs (passes of their own), for a
-/// count that is a width, or past the widest (hash_many_rounded takes
-/// the whole groups of the widest first, then the rest by this rule).
-/// Measured (November 5, 2026): the i7's 3 and 5-7 (-14 to -39%); Sam
-/// Shackleton's EPYC 9255 and Ryzen 9700X, 9-15 on 16 lanes -39 to
-/// -67%, 17-31 on 32 lanes -20 to -65%; her Xeon Gold 6330, 9-15 on 16
-/// -7 to -43%, and the remainder past 16 rounded -2 to -29%.
-fn rounded_lanes(platform: Platform, count: usize) -> Option<usize> {
-    if count <= 2 {
-        return None;
-    }
-    lane_widths(platform).iter().copied().find(|&w| w >= count).filter(|&w| w != count)
-}
-
 /// `platform.hash_many` over `inputs`, on `rounded_lanes` where a wider
 /// kernel takes the count in one pass: the spare lanes hash a copy of the
 /// last input, into scratch. Past the widest kernel, the whole groups of
 /// its width first, then the rest rounded.
-fn hash_many_rounded<const N: usize>(
+///
+/// On x86-64, every power of two from 4 through the platform's widest kernel
+/// is present in `lane_widths` (so powers of two never pad and larger powers
+/// of two divide evenly by the widest kernel). Taking `platform.hash_many`
+/// directly on powers of two keeps the 1 KiB scratch buffer and extra dispatch
+/// copies out of hot callers' stack frames and cold instruction cache lines
+/// (`#376`). Non-x86 architectures have no rounding tables and call
+/// `platform.hash_many` directly with no extra branch.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hash_many_rounded<const N: usize>(
     platform: Platform,
     inputs: &[&[u8; N]],
     key: &CVWords,
@@ -863,44 +943,14 @@ fn hash_many_rounded<const N: usize>(
     flags_end: u8,
     out: &mut [u8],
 ) {
-    // Past the widest kernel, where the rest would round: its whole groups
-    // first, one call each, then the rest below (a loop, each turn a whole
-    // group fewer).
-    let widest = lane_widths(platform).last().copied().unwrap_or(usize::MAX);
-    let mut inputs = inputs;
-    let mut out = out;
-    let mut counter = counter;
-    if inputs.len() > widest && rounded_lanes(platform, inputs.len() % widest).is_some() {
-        while inputs.len() > widest {
-            let (head, rest) = inputs.split_at(widest);
-            let (head_out, rest_out) = out.split_at_mut(widest * OUT_LEN);
-            platform.hash_many(head, key, counter, increment_counter, flags, flags_start, flags_end, head_out);
-            if increment_counter.yes() {
-                counter += widest as u64;
-            }
-            inputs = rest;
-            out = rest_out;
-        }
-    }
-    if let Some(lanes) = rounded_lanes(platform, inputs.len()) {
-        ran(Ran::RoundedUp);
-        let last = *inputs.last().expect("a count that rounds up is 3 or more");
-        let mut padded = ArrayVec::<&[u8; N], 32>::new();
-        padded.try_extend_from_slice(inputs).unwrap();
-        while padded.len() < lanes {
-            padded.push(last);
-        }
-        // The width the kernel ran at, for the test that counts it (a
-        // padding that stopped short would hash the same digests slower).
-        #[cfg(all(test, feature = "std"))]
-        ROUNDED_WIDTH.with(|w| w.set(w.get() | padded.len()));
-        let mut scratch = [0u8; 32 * OUT_LEN];
-        platform.hash_many(&padded, key, counter, increment_counter, flags, flags_start, flags_end, &mut scratch[..lanes * OUT_LEN]);
-        out[..inputs.len() * OUT_LEN].copy_from_slice(&scratch[..inputs.len() * OUT_LEN]);
-    } else {
-        platform.hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out);
-    }
+    #[cfg(blake3_sse41_ffi)]
+    ffi_partial::hash_many_rounded(platform, inputs, key, counter, increment_counter, flags, flags_start, flags_end, out);
+    #[cfg(not(blake3_sse41_ffi))]
+    platform.hash_many(inputs, key, counter, increment_counter, flags, flags_start, flags_end, out);
 }
+
+#[cfg(all(test, blake3_sse41_ffi))]
+use ffi_partial::{lane_widths, rounded_lanes};
 
 // Use SIMD parallelism to hash up to MAX_SIMD_DEGREE chunks at the same time
 // on a single thread. Write out the chunk chaining values and return the
@@ -911,7 +961,7 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
     debug_assert!(input.len() <= MAX_SIMD_DEGREE * CHUNK_LEN);
 
     let mut chunks_exact = input.chunks_exact(CHUNK_LEN);
-    let mut chunks_array = ArrayVec::<&[u8; CHUNK_LEN], MAX_SIMD_DEGREE>::new();
+    let mut chunks_array = StackVec::<&[u8; CHUNK_LEN], MAX_SIMD_DEGREE>::new();
     for chunk in &mut chunks_exact {
         chunks_array.push(chunk.try_into().unwrap());
     }
@@ -924,16 +974,8 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
     // Whole chunks that leave a lane spare, and a partial one: one pass,
     // the partial chunk in the spare lane.
     #[cfg(blake3_sse41_ffi)]
-    if let (false, Some(lanes)) = (chunks_exact.remainder().is_empty(), spare_lane(platform, chunks_array.len(), chunks_exact.remainder().len())) {
-        let (whole, partial) = (&chunks_array[..], chunks_exact.remainder());
-        // Sound: spare_lane admits each width only on a platform whose CPU
-        // has its instructions.
-        if lanes == 4 {
-            unsafe { ffi_partial::hash_chunks_with_partial_sse41(whole, partial, key, chunk_counter, flags, out) };
-        } else {
-            unsafe { ffi_partial::hash_chunks_with_partial_avx2(whole, partial, key, chunk_counter, flags, out) };
-        }
-        return whole.len() + 1;
+    if ffi_partial::try_hash_chunks_with_partial(platform, &chunks_array, chunks_exact.remainder(), key, chunk_counter, flags, out) {
+        return chunks_array.len() + 1;
     }
     // Whole chunks and a partial one, on the NEON hybrids: where a q kernel
     // covers the count, the partial chunk runs on the scalar units beside
@@ -948,7 +990,7 @@ fn compress_chunks_parallel(input: &[u8], key: &CVWords, chunk_counter: u64, fla
         && neon_hybrid::partial_pays(chunks_array.len(), chunks_exact.remainder().len())
         && neon_hybrid::sha3_detected()
     {
-        // Safe: the kernel exists for this count and the CPU has SHA-3.
+        // Sound: `partial_pays` verified the chunk count and `sha3_detected()` verified SHA-3 support; `out` holds enough room for `chunks_array.len() + 1` CVs.
         unsafe {
             neon_hybrid::hash_chunks_with_partial(&chunks_array, chunks_exact.remainder(), key, chunk_counter, flags, CHUNK_START, CHUNK_END, out);
         }
@@ -983,7 +1025,7 @@ pub(crate) fn compress_parents_parallel(child_chaining_values: &[u8], key: &CVWo
     debug_assert!(num_children <= 2 * MAX_SIMD_DEGREE, "too many");
 
     let mut parents_exact = child_chaining_values.chunks_exact(BLOCK_LEN);
-    let mut parents_array = ArrayVec::<&[u8; BLOCK_LEN], MAX_SIMD_DEGREE>::new();
+    let mut parents_array = StackVec::<&[u8; BLOCK_LEN], MAX_SIMD_DEGREE>::new();
     for parent in &mut parents_exact {
         parents_array.push(parent.try_into().unwrap());
     }
@@ -1077,16 +1119,16 @@ fn hash_one_chunk_root(input: &[u8], key: &CVWords, flags: u8) -> Hash {
         }
     };
     let mut out = [0u8; OUT_LEN];
-    // Safe: `input` holds `whole` bytes before `tail`, and blocks is 1..=16.
+    // Sound: `input` holds `(blocks - 1) * BLOCK_LEN` readable bytes before `tail`, `blocks` is in 1..=16, and `last` is 64 readable bytes.
     unsafe {
-        neon_hybrid::hash_chunk(input.as_ptr(), blocks, last, tail.len() as u8, key, 0, flags, CHUNK_START, CHUNK_END | ROOT, &mut out);
+        neon_hybrid::hash_chunk(input.as_ptr(), blocks, last, tail.len().to_le_bytes()[0], key, 0, flags, CHUNK_START, CHUNK_END | ROOT, &mut out);
     }
     Hash(out)
 }
 
 /// Run the startup self-test and detect the CPU: every program calls this
-/// once, before any other call of this
-/// crate, and a call before it panics. Under 0.2 ms, once per process
+/// once before hashing (any call that loads the detected platform before
+/// `initialize` completes panics). Under 0.2 ms, once per process
 /// (see the crate's documentation); later calls return at once.
 ///
 /// ```
@@ -1098,7 +1140,6 @@ fn hash_one_chunk_root(input: &[u8], key: &CVWords, flags: u8) -> Hash {
 /// ```
 pub fn initialize() {
     self_test::ensure();
-    platform::Platform::detect_unchecked().record();
 }
 
 /// Scheduling and storage setup shared with `blake3-servil`'s workers.
@@ -1118,20 +1159,53 @@ pub mod thread_support {
 /// key, and its `==` promises no constant time.
 pub type ContextKey = [u8; KEY_LEN];
 
-/// The most bytes a subtree starting at byte `input_offset` of a message
-/// can hold: `None` at offset zero (the whole message), else the largest
-/// power-of-two multiple of a chunk the offset is aligned to. Requires a
-/// whole-chunk offset.
-#[inline(always)]
-pub(crate) fn max_subtree_len(input_offset: u64) -> Option<u64> {
-    if input_offset == 0 {
-        return None;
+/// Prepared BLAKE3 mode (immutable key words + domain flags), private so
+/// nothing outside `domain` can mutate them independently or pair non-IV
+/// words with plain-mode flags.
+pub(crate) mod domain {
+    use super::{CVWords, DERIVE_KEY_MATERIAL, IV, KEYED_HASH, Mode, platform, throughput};
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct Domain {
+        key: CVWords,
+        flags: u8,
     }
-    assert_eq!(input_offset % CHUNK_LEN as u64, 0);
-    let counter = input_offset / CHUNK_LEN as u64;
-    let max_chunks = 1 << counter.trailing_zeros();
-    Some(max_chunks * CHUNK_LEN as u64)
+
+    impl Domain {
+        #[inline(always)]
+        pub(crate) const fn plain() -> Self {
+            Self { key: *IV, flags: 0 }
+        }
+
+        #[inline]
+        pub(crate) fn from_mode(mode: Mode<'_>) -> Self {
+            match mode {
+                Mode::Plain => Self::plain(),
+                Mode::Keyed(key) => Self { key: platform::words_from_le_bytes_32(key), flags: KEYED_HASH },
+                Mode::DeriveKey(context) => Self { key: platform::words_from_le_bytes_32(&throughput::context_key(context)), flags: DERIVE_KEY_MATERIAL },
+                Mode::DeriveKeyWith(context_key) => Self { key: platform::words_from_le_bytes_32(context_key), flags: DERIVE_KEY_MATERIAL },
+            }
+        }
+
+        #[inline(always)]
+        pub(crate) const fn key(&self) -> &CVWords {
+            &self.key
+        }
+
+        #[inline(always)]
+        pub(crate) const fn flags(&self) -> u8 {
+            self.flags
+        }
+
+        #[cfg(any(feature = "std", blake3_sse41_ffi))]
+        #[inline(always)]
+        pub(crate) const fn is_plain(&self) -> bool {
+            self.flags == 0
+        }
+    }
 }
+
+pub(crate) use domain::Domain;
 
 /// Which of BLAKE3's three functions a call computes: the plain hash
 /// ([`hash`](convenience::hash)), the keyed hash, or key derivation. Every call that takes a mode runs each one at the same
@@ -1178,12 +1252,8 @@ impl Mode<'_> {
     /// The key words and flags this mode hashes with.
     #[inline]
     pub(crate) fn key_and_flags(self) -> (CVWords, u8) {
-        match self {
-            Mode::Plain => (*IV, 0),
-            Mode::Keyed(key) => (platform::words_from_le_bytes_32(key), KEYED_HASH),
-            Mode::DeriveKey(context) => (platform::words_from_le_bytes_32(&throughput::context_key(context)), DERIVE_KEY_MATERIAL),
-            Mode::DeriveKeyWith(context_key) => (platform::words_from_le_bytes_32(context_key), DERIVE_KEY_MATERIAL),
-        }
+        let domain = Domain::from_mode(self);
+        (*domain.key(), domain.flags())
     }
 }
 
@@ -1280,8 +1350,10 @@ fn prefetch_kernels(len: usize, platform: Platform) {
     #[cfg(not(blake3_sme2))]
     let hybrids = matches!(platform, Platform::NEON);
     if hybrids && neon_hybrid::sha3_detected() {
+        let total_chunks = len.div_ceil(CHUNK_LEN);
         let whole = (len / CHUNK_LEN).min(16);
-        neon_hybrid::prefetch_tree_code(whole, if whole == 16 { 0 } else { len % CHUNK_LEN });
+        let partial = if whole == 16 { 0 } else { len % CHUNK_LEN };
+        neon_hybrid::prefetch_tree_code(whole, partial, total_chunks);
     }
 }
 
@@ -1307,7 +1379,7 @@ fn prefetch_update_kernels(len: usize, platform: Platform) {
             left -= subtree;
             continue;
         }
-        neon_hybrid::prefetch_tree_code(chunks.min(16), 0);
+        neon_hybrid::prefetch_tree_code(chunks.min(16), 0, chunks);
         counter += chunks as u64;
         left -= subtree;
     }
@@ -1409,8 +1481,8 @@ impl OutputReader {
         let output_bytes = &self.cached_block[self.position_within_block as usize..];
         let take = cmp::min(buf.len(), output_bytes.len());
         buf[..take].copy_from_slice(&output_bytes[..take]);
-        self.position_within_block += take as u8;
-        if self.position_within_block == BLOCK_LEN as u8 {
+        self.position_within_block += u8::try_from(take).expect("take <= BLOCK_LEN");
+        if usize::from(self.position_within_block) == BLOCK_LEN {
             self.inner.counter += 1;
             self.position_within_block = 0;
             self.cache_valid = false;
@@ -1506,7 +1578,7 @@ impl OutputReader {
     /// [`Seek::seek`]: #method.seek
     /// [`SeekFrom::Start`]: https://doc.rust-lang.org/std/io/enum.SeekFrom.html
     pub fn set_position(&mut self, position: u64) {
-        self.position_within_block = (position % BLOCK_LEN as u64) as u8;
+        self.position_within_block = u8::try_from(position % BLOCK_LEN as u64).expect("remainder < 64");
         self.inner.counter = position / BLOCK_LEN as u64;
         self.cache_valid = false;
     }
@@ -1525,7 +1597,7 @@ impl std::io::Read for OutputReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // Up to the output's end, where a read gives 0 bytes as a file's
         // does.
-        let len = cmp::min(buf.len() as u64, self.remaining()) as usize;
+        let len = usize::try_from(cmp::min(buf.len() as u64, self.remaining())).expect("bounded by buf.len()");
         self.fill(&mut buf[..len]);
         Ok(len)
     }
@@ -1545,7 +1617,7 @@ impl std::io::Seek for OutputReader {
         if target_position < 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start"));
         }
-        self.set_position(cmp::min(target_position, max_position) as u64);
+        self.set_position(u64::try_from(cmp::min(target_position, max_position)).expect("non-negative and <= u64::MAX"));
         Ok(self.position())
     }
 }

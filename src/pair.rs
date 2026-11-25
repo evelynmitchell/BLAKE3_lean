@@ -62,15 +62,20 @@ pub(crate) fn parent(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8,
         let last = &partial[paired * BLOCK_LEN..];
         let mut block = [0u8; BLOCK_LEN];
         block[..last.len()].copy_from_slice(last);
-        platform.compress_in_place(&mut cv, &block, last.len() as u8, chunk_counter + 1, flags | CHUNK_END);
+        platform.compress_in_place(&mut cv, &block, last.len().to_le_bytes()[0], chunk_counter + 1, flags | CHUNK_END);
         out[OUT_LEN..].copy_from_slice(&crate::hasher::le_bytes(&cv));
     }
     out
 }
 
 /// The platform's assembly `hash_many`, with the block count at run time
-/// (AVX2 and AVX-512; elsewhere each input in turn). Unsafe: each of `inputs` reaches `blocks`
-/// blocks, and the CPU has the platform.
+/// (AVX2 and AVX-512; elsewhere each input in turn).
+///
+/// # Safety
+///
+/// Each pointer in `inputs` must be valid for reads of `blocks * BLOCK_LEN`
+/// initialized bytes for the duration of this call, must not overlap `out`,
+/// and the CPU must support `platform`.
 #[allow(clippy::too_many_arguments)]
 // Out of line: inlined into Platform::hash_many once its portable arm went,
 // batches of one to three 64 B messages after other work ran 5-12% slower on
@@ -89,7 +94,11 @@ pub(crate) unsafe fn hash_many_blocks(
     flags_end: u8,
     out: &mut [u8],
 ) {
-    assert!(out.len() >= inputs.len() * OUT_LEN && (1..=CHUNK_LEN / BLOCK_LEN).contains(&blocks));
+    assert!(inputs.len() <= out.len() / OUT_LEN && (1..=CHUNK_LEN / BLOCK_LEN).contains(&blocks));
+    #[cfg(all(test, feature = "std"))]
+    let _ = BLOCKS_CALLS.try_with(|c| c.borrow_mut().push((blocks, inputs.len())));
+    #[cfg(all(test, feature = "std"))]
+    crate::record_hash_many_call(blocks, inputs.len());
     if !takes_platform(platform) {
         // Elsewhere one input after another on the platform's compression
         // (for the tests of hash_many's batches on every platform).
@@ -99,7 +108,7 @@ pub(crate) unsafe fn hash_many_blocks(
                 // Sound: `p` reaches `blocks` blocks.
                 let block: &[u8; BLOCK_LEN] = unsafe { &*(p.add(b * BLOCK_LEN) as *const [u8; BLOCK_LEN]) };
                 let f = flags | if b == 0 { flags_start } else { 0 } | if b + 1 == blocks { flags_end } else { 0 };
-                platform.compress_in_place(&mut cv, block, BLOCK_LEN as u8, counter + if increment { i as u64 } else { 0 }, f);
+                platform.compress_in_place(&mut cv, block, u8::try_from(BLOCK_LEN).unwrap(), counter + if increment { i as u64 } else { 0 }, f);
             }
             out[i * OUT_LEN..][..OUT_LEN].copy_from_slice(&crate::hasher::le_bytes(&cv));
         }
@@ -108,13 +117,52 @@ pub(crate) unsafe fn hash_many_blocks(
     let (n, input, key, out) = (inputs.len(), inputs.as_ptr(), key.as_ptr(), out.as_mut_ptr());
     match platform {
         #[cfg(blake3_avx2_ffi)]
+        // Sound: `Platform::AVX2` proves AVX2 support; `inputs` holds valid `blocks`-block pointers and `out` was asserted to hold `n * OUT_LEN` bytes.
         Platform::AVX2 => unsafe {
             crate::avx2::ffi::blake3_servil_hash_many_avx2(input, n, blocks, key, counter, increment, flags, flags_start, flags_end, out)
         },
         #[cfg(blake3_avx512_ffi)]
+        // Sound: `Platform::AVX512` proves AVX-512F+VL support; `inputs` holds valid `blocks`-block pointers and `out` was asserted to hold `n * OUT_LEN` bytes.
         Platform::AVX512 => unsafe {
             crate::avx512::ffi::blake3_servil_hash_many_avx512(input, n, blocks, key, counter, increment, flags, flags_start, flags_end, out)
         },
         _ => unreachable!("takes_platform admitted AVX2 or AVX-512"),
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    /// `(blocks, inputs.len())` calls to `hash_many_blocks` on this thread, for dispatch tests.
+    pub(crate) static BLOCKS_CALLS: core::cell::RefCell<std::vec::Vec<(usize, usize)>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn hash_many_blocks_checks_output_room_and_block_count() {
+        crate::initialize();
+        let platform = Platform::detect();
+        let block = [0u8; BLOCK_LEN];
+        let ptrs = [block.as_ptr(), block.as_ptr()];
+        let mut short_out = [0u8; 2 * OUT_LEN - 1];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                hash_many_blocks(platform, &ptrs, 1, crate::IV, 0, false, 0, CHUNK_START, CHUNK_END, &mut short_out);
+            }))
+            .is_err(),
+            "one-byte-short output must panic"
+        );
+        let mut ok_out = [0u8; 2 * OUT_LEN];
+        for bad_blocks in [0usize, CHUNK_LEN / BLOCK_LEN + 1] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    hash_many_blocks(platform, &ptrs, bad_blocks, crate::IV, 0, false, 0, CHUNK_START, CHUNK_END, &mut ok_out);
+                }))
+                .is_err(),
+                "invalid block count {bad_blocks} must panic"
+            );
+        }
     }
 }

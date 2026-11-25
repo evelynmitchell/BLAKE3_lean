@@ -18,10 +18,27 @@ The gates of a commit, from what it changes against next:
   nothing but *.md files           none (the fast-forward alone)
   anything else                    the jobs of the tests' workflow on the
                                    commit (ci.yml), all green; check-builds;
-                                   mutants on x86_64, aarch64 and arm64;
-                                   tests on aarch64 and arm64; cells
+                                   mutants on x86_64 and arm64;
+                                   tests on aarch64 and arm64
+  benchmarked library code (src/, c/, build.rs, Cargo.toml, Cargo.lock,
+                            threads/src/, threads/build.rs,
+                            threads/Cargo.toml, threads/Cargo.lock,
+                            version/src/, version/Cargo.toml)
+                                   cells as well
+  shipped code (src/, c/, build.rs, threads/src/, threads/build.rs,
+                b3sum/src/, capi/src/, capi/b3.h, version/src/,
+                the crates' Cargo.toml)
+                                   review as well
   proof inputs (c/, c2sp/, tools/verify/, the generators)
                                    long proofs as well
+
+(November 23, 2026: Zooko approved dropping per-landing `mutants aarch64`
+on arm-vm and scoping `cells` to benchmarked library code after Nov 23's
+wall-clock audit showed arm-vm mutants cost 7.1 hours across 19 runs with
+0 unique defects — while native x86_64 [1.5m] and Mac M6 arm64+SME2 [1.7m]
+cover mutation testing fast, and `tests aarch64` stays on arm-vm. arm-vm
+mutants remain available on demand for pre-release checks via
+tools/mutants/check.py.)
 
 `gate` runs check-builds and the x86-64 mutants here, in a worktree of
 their own at COMMIT. The others run where they run (the Arm VM, the Mac,
@@ -30,17 +47,41 @@ posted with `record`, whose description says where the log is. A gate
 that does not apply is recorded as success with a description that
 begins "waived: " and gives the reason; the waiver is then on the commit
 for every reader, which a skipped step never was.
+
+`review` is one review of a change to shipped code by an AI model of
+another family than its author's (CONTRIBUTING, "Branches and changes";
+tools/review/BRIEF.md is the brief). It holds a landing only for a
+wrong result, a crash or panic, a hang, or a slowdown; everything else
+lands and becomes an issue. Its description names the reviewer and says
+what it found and what was done about it; its report is public.
+(November 22, 2026: Zooko's trial of Rule 2, after a single review of
+shipped code caught the running-digest slowdown of #472 while
+multi-round reviews of tools and lists slowed down landings.)
 """
 
 import json
 import os
 import subprocess
 import sys
+import time
 
 REPO = "servil-software-factory/BLAKE3"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL = ("check-builds", "mutants x86_64")
-ELSEWHERE = ("mutants aarch64", "mutants arm64", "tests aarch64", "tests arm64", "cells")
+ELSEWHERE = ("mutants arm64", "tests aarch64", "tests arm64")
+RECORDABLE = ELSEWHERE + LOCAL + ("cells", "review", "long proofs")
+PERF_CODE = (
+    "src/", "c/", "build.rs", "Cargo.toml", "Cargo.lock",
+    "threads/src/", "threads/build.rs", "threads/Cargo.toml", "threads/Cargo.lock",
+    "version/src/", "version/Cargo.toml",
+)
+SHIPPED_CODE = (
+    "src/", "c/", "build.rs", "Cargo.toml",
+    "threads/src/", "threads/build.rs", "threads/Cargo.toml",
+    "b3sum/src/", "b3sum/Cargo.toml",
+    "capi/src/", "capi/b3.h", "capi/Cargo.toml",
+    "version/src/", "version/Cargo.toml",
+)
 PROOF_INPUTS = ("c/", "c2sp/", "tools/verify/", "tools/gen_neon_hybrid.py", "tools/gen_sme2_hybrid.py", "tools/gen_x86.py", "tools/gen_x86_chunk_root.py",
                 "tools/gen_avx512_32.py", "tools/gen_output8.py", "tools/gen_output16.py")
 
@@ -56,11 +97,27 @@ def api(path, *fields, method="GET"):
     return json.loads(out.stdout) if out.stdout.strip() else None
 
 
+def _matches(path, rules):
+    return any(path.startswith(p) if p.endswith("/") else path == p for p in rules)
+
+
+def is_perf(path):
+    return _matches(path, PERF_CODE)
+
+
+def is_shipped(path):
+    return _matches(path, SHIPPED_CODE)
+
+
 def required(paths):
     """The gates a change to `paths` needs (see the module's text)."""
     if all(p.endswith(".md") for p in paths):
         return ()
     gates = ("CI",) + LOCAL + ELSEWHERE
+    if any(is_perf(p) for p in paths):
+        gates += ("cells",)
+    if any(is_shipped(p) for p in paths):
+        gates += ("review",)
     if any(p.startswith(PROOF_INPUTS) for p in paths):
         gates += ("long proofs",)
     return gates
@@ -190,12 +247,46 @@ def run_local(sha):
     subprocess.run(["git", "-C", ROOT, "worktree", "remove", "--force", tree], capture_output=True)
 
 
+def check_counts(base, sha):
+    """Run tools/counts.py --check unconditionally; fail if missing or rising."""
+    counts_script = os.path.join(ROOT, "tools", "counts.py")
+    if not os.path.isfile(counts_script):
+        sys.exit(f"land: required ratchet script missing: {counts_script}")
+    run = subprocess.run([sys.executable, counts_script, "--check", base, sha], capture_output=True, text=True)
+    if run.returncode != 0:
+        msg = (run.stderr or run.stdout).strip()
+        sys.exit(f"land: counts ratchet failed: {msg}")
+    return run.stdout.strip()
+
+
+def push_next(sha, run=subprocess.run, sleep=time.sleep):
+    """Push `sha` to `origin/next`, retrying brief GitHub `landable` propagation lag."""
+    cmd = ["git", "-C", ROOT, "push", "origin", f"{sha}:refs/heads/next"]
+    for attempt in range(4):
+        res = run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            if res.stdout:
+                sys.stdout.write(res.stdout)
+            if res.stderr:
+                sys.stderr.write(res.stderr)
+            return
+        err = res.stderr or ""
+        if attempt < 3 and "GH006" in err and "landable" in err:
+            sleep(2)
+            continue
+        if res.stdout:
+            sys.stdout.write(res.stdout)
+        if err:
+            sys.stderr.write(err)
+        raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, err)
+
+
 def main(argv):
     if len(argv) < 2 or argv[0] not in ("status", "gate", "record", "land"):
         sys.exit(__doc__)
     if argv[0] == "record":
-        if len(argv) != 5 or argv[1] not in ELSEWHERE + LOCAL + ("long proofs",):
-            sys.exit("land: record GATE COMMIT success|failure DESCRIPTION, GATE one of: " + ", ".join(ELSEWHERE + LOCAL + ("long proofs",)))
+        if len(argv) != 5 or argv[1] not in RECORDABLE:
+            sys.exit("land: record GATE COMMIT success|failure DESCRIPTION, GATE one of: " + ", ".join(RECORDABLE))
         post(git("rev-parse", argv[2] + "^{commit}"), argv[1], argv[3], argv[4])
         return
     sha, base, paths = resolve(argv[1])
@@ -207,12 +298,18 @@ def main(argv):
         print(f"  {verdict:8s} {gate}: {description}")
     missing = [g for g, v, _ in gates if v != "success"]
     if argv[0] != "land":
+        try:
+            print("  " + check_counts(base, sha))
+        except SystemExit as e:
+            print(f"  failure  counts: {e}")
+            missing.append("counts")
         print(f"land: {sha[:12]} " + ("has every gate" if not missing else "lacks: " + ", ".join(missing)))
         return
     if missing:
         sys.exit(f"land: {sha[:12]} does not land: " + ", ".join(missing))
+    check_counts(base, sha)
     post(sha, "landable", "success", landable(base, [g for g, _, _ in gates]))
-    subprocess.run(["git", "-C", ROOT, "push", "origin", f"{sha}:refs/heads/next"], check=True)
+    push_next(sha)
     print(f"land: next is {sha}")
 
 

@@ -13,7 +13,23 @@ use blake3_servil::{Mode, throughput::*};
 
 #[path = "../../tools/require_nextest.rs"]
 mod require_nextest;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn range(&mut self, len: usize) -> usize {
+        self.next_u64() as usize % len
+    }
+}
+
 use std::{
     collections::VecDeque,
     future::Future,
@@ -26,7 +42,7 @@ use std::{
 };
 
 // WALKED
-// Pipeline::new Pipeline::with_owners Pipeline::message Pipeline::room Pipeline::commit Pipeline::end Pipeline::abort Pipeline::owned
+// Pipeline::new Pipeline::with_owners Pipeline::with_batches Pipeline::with_owners_and_batches Pipeline::message Pipeline::message_with Pipeline::room Pipeline::commit Pipeline::end Pipeline::abort Pipeline::owned
 // Pipeline::lent Pipeline::batch Pipeline::next_event Pipeline::ready Pipeline::Drop Room::len Room::bytes_mut Room::as_mut_ptr Room::Drop Lent::Drop
 // Pipeline::Send Room::Send
 // NOT_WALKED
@@ -275,8 +291,24 @@ async fn without_owners(mode: Mode<'static>, limits: Limits, data: &[u8]) {
     let Some(Event::Hashed { tag: 1, hash, owner: None }) = p.next_event() else { panic!("the loan's event") };
     assert_eq!(*hash.as_bytes(), official(mode, &data[..1025]));
     drop(guard);
+    {
+        let mut pb = Pipeline::<usize, (), blake3_servil::throughput::Packed<32>>::with_batches(mode, Limits { messages: 1, rooms: 0 });
+        let mb = pb.message(0, None).await;
+        let mut packed = blake3_servil::throughput::Packed::<32>::new(4);
+        for (i, item) in packed.iter_mut().enumerate() {
+            item.fill(i as u8);
+        }
+        pb.batch(mb, packed, vec![[0u8; 32]; 4].into_boxed_slice());
+        pb.ready().await;
+        let Some(Event::Batch { batch, digests, .. }) = pb.next_event() else {
+            panic!("expected packed Event::Batch");
+        };
+        for i in 0..4 {
+            assert_eq!(digests[i], official(mode, &batch[i]));
+        }
+    }
     if limits.rooms > 0 {
-        let mut m = p.message(2, None).await;
+        let mut m = p.message_with(mode, 2, None).await;
         let mut room = p.room().await;
         room.bytes_mut()[..37].copy_from_slice(&data[..37]);
         p.commit(&mut m, &mut room, 37);
@@ -317,11 +349,11 @@ async fn exercise() {
     eprintln!("{paths} depth-five paths");
     const SEED: u64 = 0x774aa90;
     eprintln!("seed {SEED:#x}");
-    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut rng = SplitMix64(SEED);
     let mut w = Walk::new(MODES[1], Limits { messages: 3, rooms: 2 }, &data);
     for _ in 0..2300 {
         let choices = w.choices();
-        w.step(choices[rng.random_range(0..choices.len())]).await;
+        w.step(choices[rng.range(choices.len())]).await;
     }
     w.finish().await;
 }
@@ -351,6 +383,42 @@ fn a_pipeline_and_its_tokens_move_to_another_thread_mid_message() {
         *hash.as_bytes()
     });
     assert_eq!(there.join().unwrap(), official(mode, &data));
+}
+#[test]
+fn keyed_pipeline_with_owners_and_batches_mixes_owned_and_packed() {
+    blake3_servil::initialize_multithreaded(Some(3.try_into().unwrap()));
+    let mode = MODES[1];
+    let mut p = Pipeline::<usize, Vec<u8>, blake3_servil::throughput::Packed<32>>::with_owners_and_batches(mode, Limits { messages: 4, rooms: 0 });
+    let owned_msg: Vec<u8> = (0..3000).map(|i| ((i * 19 + 5) & 0xff) as u8).collect();
+    let mut packed = blake3_servil::throughput::Packed::<32>::new(1030);
+    for i in 0..1030 {
+        let idx = (i as u32).to_le_bytes();
+        for j in 0..32 {
+            packed[i][j] = if j < 4 { idx[j] } else { ((i * 7 + j * 11) & 0xff) as u8 };
+        }
+    }
+    let (m0, m1) = block_on(async { (p.message(0, None).await, p.message(1, None).await) });
+    p.owned(m0, owned_msg.clone());
+    p.batch(m1, packed, vec![[0u8; 32]; 1030].into_boxed_slice());
+    let mut got = 0;
+    while got < 2 {
+        match p.next_event() {
+            Some(Event::Hashed { tag: 0, hash, owner: Some(buf) }) => {
+                assert_eq!(buf, owned_msg);
+                assert_eq!(*hash.as_bytes(), official(mode, &owned_msg));
+                got += 1;
+            }
+            Some(Event::Batch { tag: 1, batch, digests }) => {
+                assert_eq!(batch.len(), 1030);
+                for i in 0..1030 {
+                    assert_eq!(digests[i], official(mode, &batch[i]));
+                }
+                got += 1;
+            }
+            Some(_) => panic!("unexpected event"),
+            None => block_on(p.ready()),
+        }
+    }
 }
 #[test]
 fn both_executors_deliver_the_promised_events_without_workers() {

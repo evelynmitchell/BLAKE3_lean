@@ -57,7 +57,7 @@ TARGET = os.path.join(ROOT, "target", "tests-coverage")
 # the integration tests, release), with the public features on, as the
 # mutation check builds (tools/mutants/check.py): the tests behind them
 # are in the map too, so a map serves the mutation check's narrowing.
-SUITE = ["--release", "--lib", "--tests", "--features", "serde"]
+SUITE = ["--release", "--lib", "--tests"]
 # Changes here reach code coverage cannot see: every test runs.
 EVERYTHING = re.compile(r"^(c/|build\.rs$|Cargo\.toml$|Cargo\.lock$|\.cargo/|\.config/|src/.*\.(S|c|h)$)")
 # Crates and suites of their own, which the library's tests never run:
@@ -105,19 +105,21 @@ def base_with_map():
 
 def read_map(tree):
     tests, instrumented = {}, {}
-    for line in open(map_path(tree)):
-        test, path, lines = line.rstrip("\n").split("\t")
-        lines = {int(n) for n in lines.split(",") if n}
-        if test == "#instrumented":
-            instrumented[path] = lines
-        else:
-            tests.setdefault(test, {})[path] = lines
+    with open(map_path(tree)) as f:
+        for line in f:
+            test, path, lines = line.rstrip("\n").split("\t")
+            lines = {int(n) for n in lines.split(",") if n}
+            if test == "#instrumented":
+                instrumented[path] = lines
+            else:
+                tests.setdefault(test, {})[path] = lines
     return tests, instrumented
 
 
 def write_map(tree, tests, instrumented):
     os.makedirs(MAPS, exist_ok=True)
-    open(os.path.join(MAPS, "latest"), "w").write(tree + "\n")
+    with open(os.path.join(MAPS, "latest"), "w") as f:
+        f.write(tree + "\n")
     with open(map_path(tree), "w") as f:
         for path in sorted(instrumented):
             f.write(f"#instrumented\t{path}\t{','.join(map(str, sorted(instrumented[path])))}\n")
