@@ -986,8 +986,14 @@ written to its shape (a message lent in three parts, two short ones in
 one group; 7,000 schedules, about 70 distinct), after the same two
 corrections to its waits; a model whose parts count themselves off only
 once every part has written, and code whose every part (not only the
-last) wakes the owner, are each rejected. `PipeStorage`, `PipeSlots`,
-`PipeQueue` and `PipeShort` are not yet checked against the code (#31).
+last) wakes the owner, are each rejected. `PipeStorage.tla` is checked
+against `a_storage_outlives_its_pipeline_in_its_rooms` (a Pipeline of
+three Rooms dropped while two are alive on threads of their own, then
+the next Pipeline of its size; 7,000 schedules, about 35 distinct) as it
+was: a model whose surviving Rooms drop only once `Pipeline::drop` has
+begun, and a drop that gives back an unheld room's hold as it clears
+the room's count, are each rejected. `PipeSlots`, `PipeQueue` and
+`PipeShort` are not yet checked against the code (#31).
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
