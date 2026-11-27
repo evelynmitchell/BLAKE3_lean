@@ -21,11 +21,11 @@ compare.
 
 Then the models are checked against the code (trace validation): the
 Shuttle tests of finish.rs, waker.rs (both), park.rs (owed_wakes_cascade)
-and the Pipeline (shuttle_pipeline.rs's wait for a Room, and its lent
-parts and group) log every schedule, operation by operation, and each
+and the Pipeline (shuttle_pipeline.rs's wait for a Room, its lent parts
+and group, and a storage outliving its Pipeline) log every schedule, operation by operation, and each
 log, turned into its model's actions, must be a behavior of the model
 (FinishTrace.tla, WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla,
-PipeTasksTrace.tla).
+PipeTasksTrace.tla, PipeStorageTrace.tla).
 
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
@@ -489,10 +489,13 @@ SITES = {
     "slot_done": ("pipeline.rs", "slot_done: (0..m).map(|_| OwnLine(AtomicBool::new(true))).collect(),"),
     "loan_completed": ("pipeline.rs", "loan_completed: (0..messages).map(|_| OwnLine(AtomicU64::new(0))).collect(),"),
     "completed_epoch": ("pipeline.rs", "completed_epoch: OwnLine(AtomicU64::new(0)),"),
+    "holders": ("pipeline.rs", "holders: OwnLine(AtomicUsize::new(1)),"),
 }
 REFS, DONE, WOKEN, STATE = "refs", "done", "woken", "state"
 CREDITS = 1 << 30   # pipeline.rs's ROOM_CREDITS
 TASKS_LEFT, SLOT_DONE, LOAN, EPOCH = "tasks_left", "slot_done", "loan_completed", "completed_epoch"
+HOLDERS = "holders"
+CLOSING = 1 << 63   # pipeline.rs's ROOM_CLOSING_BIT
 
 
 def site_names(tree):
@@ -661,6 +664,59 @@ def check_tasks_traces(tla_jar, models, lines):
     return check_traces(tla_jar, models, "PipeTasksTrace", {"Parts = 3\n          Members = 2": (ts, len(lines))})
 
 
+def storage_trace(line):
+    """One schedule of tests/shuttle_pipeline.rs's
+    a_storage_outlives_its_pipeline_in_its_rooms as PipeStorage.tla's
+    actions, for the first Pipeline's storage (its rooms numbered in the
+    order they are first handed out, then stamped). Pipeline::drop's hold
+    for every room is `holders`' addition; its stamp, a room count's
+    fetch_or of the closing bit; its clear of an unheld room's count, the
+    store of 0 after; its release, `holders`' subtraction. A surviving
+    Room's drop is the subtraction of its credits on its own thread, then,
+    with the bit set, its store of 0 and its release of one hold. The next
+    Pipeline's take is `holders`' store of 1 on that storage, and its
+    hand-out a store of all a room's credits there; past that the trace
+    ends (a next Pipeline that made a storage of its own is not this
+    one's)."""
+    events = [e.split("|") for e in line.split(";")]
+    owner = CALLER
+    out, phase, room, holders, mine = [], "first", {}, None, {}
+    act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
+    for (thread, s, a, op, old, new) in events:
+        if phase == "end":
+            break
+        if s == REFS and a not in room and phase == "first":
+            room[a] = len(room) + 1
+        if s == REFS and a not in room and op == "or" and phase == "drop":
+            room[a] = len(room) + 1
+        if thread != owner:
+            if s == REFS and op == "sub" and a in room:
+                mine[thread] = room[a]; act("RoomDrop", r=room[a])
+            elif s == REFS and op == "store" and new == "0" and thread in mine:
+                act("RoomClear", r=mine[thread])
+            elif s == HOLDERS and op == "sub" and thread in mine:
+                act("RoomRelease", r=mine[thread])
+        elif s == HOLDERS and op == "add" and phase == "first":
+            holders = a; act("Reserve"); phase = "drop"
+        elif s == REFS and op == "or" and phase == "drop":
+            act("Stamp")
+        elif s == REFS and op == "store" and new == "0" and int(old) == CLOSING and phase == "drop":
+            act("Unstamp")
+        elif s == HOLDERS and a == holders and op == "sub" and phase == "drop":
+            act("Release"); phase = "dropped"
+        elif s == HOLDERS and a == holders and op == "store" and new == "1" and phase == "dropped":
+            act("Take"); phase = "next"
+        elif s == REFS and op == "store" and new == str(CREDITS) and phase == "next" and a in room:
+            act("HandOut", r=room[a]); phase = "end"
+    return "<<" + ", ".join(out) + ">>"
+
+
+def check_storage_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against PipeStorage.tla (three rooms, two surviving)."""
+    ts = {storage_trace(line) for line in lines}
+    return check_traces(tla_jar, models, "PipeStorageTrace", {"Rooms = 3\n          Survivors = 2": (ts, len(lines))})
+
+
 def record_pipeline(tree, build):
     """tests/shuttle_pipeline.rs's traced scenarios' schedules: {name: lines},
     each atomic named (site_names)."""
@@ -783,6 +839,14 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
                        "                self.slot_done[slot].swap(true, Ordering::SeqCst);\n            });\n        }\n    }\n}\n\n/// Settle the lazy merges",
                        "                self.slot_done[slot].swap(true, Ordering::SeqCst);\n            });\n        } else {\n            storage.waker.notify_after_seqcst();\n        }\n    }\n}\n\n/// Settle the lazy merges",
                        lambda tree, build: record_pipeline(tree, build)["lent_parts"], check_tasks_traces)),
+        ("PipeStorage.tla's surviving Rooms drop only once Pipeline::drop has begun (narrower than the code)",
+         *model_control(tla_jar, "PipeStorage.tla", 'RoomDrop(r) == /\\ rpc[r] = "drop"', 'RoomDrop(r) == /\\ rpc[r] = "drop" /\\ dpc # "reserve"',
+                        check_storage_traces, pipeline["storage"])),
+        ("pipeline.rs's Pipeline::drop gives back an unheld room's hold as it clears its count (the model does not)",
+         *code_control(tla_jar, "threads/src/pipeline.rs",
+                       "                r.store(0, Ordering::Relaxed);\n            }\n        }\n        let release_holds = (room_count - survivors) + 1;",
+                       "                r.store(0, Ordering::Relaxed);\n                PipeStorage::release_n(storage, 1);\n            }\n        }\n        let release_holds = 1;",
+                       lambda tree, build: record_pipeline(tree, build)["storage"], check_storage_traces)),
         ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
          *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
                        "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
@@ -822,7 +886,8 @@ def main(argv):
     pipeline = record_pipeline(ROOT, build)
     for spec, check, lines in [("FinishTrace", check_finish_traces, finish_lines), ("WakerTrace", check_waker_traces, waker_lines),
                                ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline["room_wait"]),
-                               ("PipeTasksTrace", check_tasks_traces, pipeline["lent_parts"])]:
+                               ("PipeTasksTrace", check_tasks_traces, pipeline["lent_parts"]),
+                               ("PipeStorageTrace", check_storage_traces, pipeline["storage"])]:
         passed, said = check(tla_jar, HERE, lines)
         print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
         if not passed:

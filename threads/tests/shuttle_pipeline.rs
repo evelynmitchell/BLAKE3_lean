@@ -679,6 +679,34 @@ fn a_room_outlives_its_pipeline() {
     });
 }
 
+/// A Pipeline of three Rooms dropped while two of its Rooms are alive on
+/// threads of their own, each dropped there; then the next Pipeline of its
+/// size takes a storage (that one, if it is free by then) and a room: as
+/// tools/verify/tla/PipeStorage.tla has them. Traced (PipeStorageTrace.tla).
+fn a_storage_outlives_its_pipeline_in_its_rooms() {
+    check(|| {
+        trace::start("storage");
+        with_workers(1, || {
+            let limits = Limits { messages: 1, rooms: 3 };
+            let mut first = Pipeline::<usize, ()>::new(Mode::Plain, limits);
+            let survivors: Vec<_> = (0..2)
+                .map(|_| {
+                    let room = block_on(first.room());
+                    thread::spawn(move || drop(room))
+                })
+                .collect();
+            drop(first);
+            let mut next = Pipeline::<usize, ()>::new(Mode::Plain, limits);
+            drop(block_on(next.room()));
+            for survivor in survivors {
+                survivor.join().unwrap();
+            }
+            drop(next);
+        });
+        trace::write();
+    });
+}
+
 /// A wait for a Room while the Pipeline's one Room is alive on another
 /// thread, with bytes committed from it that a worker may still be
 /// reading: the wait ends when the Room has been dropped there and the
@@ -915,11 +943,12 @@ fn an_aborted_message_leaves_the_others_whole() {
 #[test]
 fn the_pipeline_under_shuttle() {
     blake3_servil_core::initialize();
-    let scenarios: [(&str, fn()); 10] = [
+    let scenarios: [(&str, fn()); 11] = [
         ("messages_through_rooms_complete_with_their_own_digests", messages_through_rooms_complete_with_their_own_digests),
         ("owned_messages_complete_and_wake_the_caller", owned_messages_complete_and_wake_the_caller),
         ("a_pipeline_after_another_reuses_its_storage_soundly", a_pipeline_after_another_reuses_its_storage_soundly),
         ("a_room_outlives_its_pipeline", a_room_outlives_its_pipeline),
+        ("a_storage_outlives_its_pipeline_in_its_rooms", a_storage_outlives_its_pipeline_in_its_rooms),
         ("a_wait_for_a_room_ends_when_another_thread_drops_one", a_wait_for_a_room_ends_when_another_thread_drops_one),
         ("lent_messages_are_complete_when_their_events_come", lent_messages_are_complete_when_their_events_come),
         ("lent_parts_and_a_group", lent_parts_and_a_group),
