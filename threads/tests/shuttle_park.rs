@@ -16,10 +16,88 @@
 //! parked worker when any is parked. Every published task is taken.
 #![cfg(shuttle)]
 
+/// This execution's operations, for trace validation of Park.tla: the
+/// parked word and the owed word (park.rs's atomics, in the order Park::new
+/// makes them), parks, and the test's `published`. Logged only while
+/// `ON` (owed_wakes_cascade), each atomic operation from inside Shuttle's
+/// own step (a `fetch_update`): Shuttle switches threads before and after
+/// an atomic operation, never within one, so the log's order is theirs.
+mod log {
+    std::thread_local! {
+        pub static ON: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+        static LOG: core::cell::RefCell<Vec<String>> = const { core::cell::RefCell::new(Vec::new()) };
+        pub static MADE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    pub fn log(what: &str, op: String) {
+        if ON.with(|o| o.get()) {
+            let id = format!("{:?}", shuttle::thread::current().id());
+            LOG.with(|l| l.borrow_mut().push(format!("{id}|{what}|{op}")));
+        }
+    }
+
+    pub fn start() {
+        LOG.with(|l| l.borrow_mut().clear());
+        MADE.with(|m| m.set(0));
+        ON.with(|o| o.set(true));
+    }
+
+    /// The finished execution's log, a line, appended to $PARK_TRACE's
+    /// file in one write.
+    pub fn write() {
+        ON.with(|o| o.set(false));
+        let lines = LOG.with(|l| core::mem::take(&mut *l.borrow_mut()));
+        if let Some(path) = std::env::var_os("PARK_TRACE") {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+            f.write_all(format!("{}\n", lines.join(";")).as_bytes()).unwrap();
+        }
+    }
+}
+
 /// Shuttle's primitives, under the names src/park.rs imports them by.
 mod park_sync {
-    pub use shuttle::sync::atomic::{AtomicU64, Ordering, fence};
-    pub use shuttle::thread;
+    pub use shuttle::sync::atomic::{Ordering, fence};
+
+    /// park.rs's words, each operation logged (`log`): `word` 0 the
+    /// parked bits, 1 the owed wakes.
+    pub struct AtomicU64(shuttle::sync::atomic::AtomicU64, usize);
+
+    impl AtomicU64 {
+        pub fn new(v: u64) -> Self {
+            AtomicU64(shuttle::sync::atomic::AtomicU64::new(v), crate::log::MADE.with(|m| m.replace(m.get() + 1)))
+        }
+        fn op(&self, o: Ordering, f: impl Fn(u64) -> Option<u64>, what: impl Fn(u64) -> String) -> Result<u64, u64> {
+            self.0.fetch_update(o, o, |x| {
+                crate::log::log(&format!("word{}", self.1), what(x));
+                f(x)
+            })
+        }
+        pub fn load(&self, o: Ordering) -> u64 {
+            self.op(o, |_| None, |x| format!("load {x}")).unwrap_or_else(|x| x)
+        }
+        pub fn fetch_or(&self, v: u64, o: Ordering) -> u64 {
+            self.op(o, |x| Some(x | v), |x| format!("or {x} {v}")).unwrap_or_else(|x| x)
+        }
+        pub fn fetch_and(&self, v: u64, o: Ordering) -> u64 {
+            self.op(o, |x| Some(x & v), |x| format!("and {x} {v}")).unwrap_or_else(|x| x)
+        }
+        pub fn swap(&self, v: u64, o: Ordering) -> u64 {
+            self.op(o, |_| Some(v), |x| format!("swap {x} {v}")).unwrap_or_else(|x| x)
+        }
+        pub fn compare_exchange(&self, current: u64, new: u64, o: Ordering, _f: Ordering) -> Result<u64, u64> {
+            self.op(o, |x| (x == current).then_some(new), |x| format!("cas {x} {current} {new}"))
+        }
+    }
+
+    pub mod thread {
+        pub use shuttle::thread::{Thread, current};
+        /// Logged as it returns: no switch between.
+        pub fn park() {
+            shuttle::thread::park();
+            crate::log::log("park", String::new());
+        }
+    }
 
     /// A once-set cell, as std's OnceLock (which Shuttle lacks): set once,
     /// read many; behind Shuttle's Mutex so the model sees the handoff.
@@ -125,22 +203,46 @@ fn two_workers_two_publishers() {
     run(2, 2, 2);
 }
 
+/// The test's `published`, its loads and stores logged (`log`).
+struct Published(AtomicUsize);
+
+impl Published {
+    fn load(&self) -> usize {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                log::log("published", format!("load {x}"));
+                None
+            })
+            .unwrap_or_else(|x| x)
+    }
+    fn store(&self, v: usize) {
+        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+            log::log("published", format!("store {x} {v}"));
+            Some(v)
+        });
+    }
+}
+
 /// wake_for owes wakes that cascade: with three workers parked, three
 /// pieces published at once, and a fan-out of one, the publisher wakes one,
-/// each woken worker the next, and every worker is woken.
+/// each woken worker the next, and every worker is woken. Its schedules are
+/// logged and, with `PARK_TRACE` set, written to that file, a line a
+/// schedule: tools/verify/tla/check.py checks each is a behavior of
+/// Park.tla (trace validation, ParkTrace.tla).
 #[test]
 fn owed_wakes_cascade() {
     shuttle::check_pct(
         || {
+            log::start();
             let park = Arc::new(Park::new(3, 1));
-            let published = Arc::new(AtomicUsize::new(0));
+            let published = Arc::new(Published(AtomicUsize::new(0)));
             let woken = Arc::new(AtomicUsize::new(0));
             let mut threads = Vec::new();
             for me in 0..3 {
                 let (park, published, woken) = (park.clone(), published.clone(), woken.clone());
                 threads.push(thread::spawn(move || {
                     park.register(me);
-                    if park.park_unless(me, || published.load(Ordering::SeqCst) > 0) {
+                    if park.park_unless(me, || published.load() > 0) {
                         park.pay_owed();
                     }
                     woken.fetch_add(1, Ordering::SeqCst);
@@ -148,13 +250,14 @@ fn owed_wakes_cascade() {
             }
             let (p, pub2) = (park.clone(), published.clone());
             threads.push(thread::spawn(move || {
-                pub2.store(3, Ordering::SeqCst);
+                pub2.store(3);
                 p.wake_for(3, 3);
             }));
             for t in threads {
                 t.join().unwrap();
             }
             assert_eq!(woken.load(Ordering::SeqCst), 3);
+            log::write();
         },
         3000,
         3,

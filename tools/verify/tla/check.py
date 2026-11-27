@@ -16,6 +16,12 @@ sampled schedules cannot state. They model the code; they are not it. The
 names of the actions follow the functions they model, for a reader to
 compare.
 
+Then the models are checked against the code (trace validation): the
+Shuttle tests of finish.rs, waker.rs (its first test) and park.rs
+(owed_wakes_cascade) log every schedule, operation by operation, and each
+log, turned into its model's actions, must be a behavior of the model
+(FinishTrace.tla, WakerTrace.tla, ParkTrace.tla).
+
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
 wake not passed on) in a copy of the models, in a temporary directory, and
@@ -60,8 +66,8 @@ CONTROLS = [
     ("Waker", "the caller does not re-check after registering", "Waker.tla",
      "             /\\ cpc' = IF done > seen THEN \"clear0\" ELSE \"pending\"", "             /\\ cpc' = \"pending\""),
     ("Waker", "the worker takes the Waker while the caller writes it", "Waker.tla",
-     "             /\\ IF state = \"registered\"\n                THEN state' = \"waking\"",
-     "             /\\ IF state \\in {\"registered\", \"writing\"}\n                THEN state' = \"waking\""),
+     "              /\\ IF state = \"registered\"\n                 THEN state' = \"waking\"",
+     "              /\\ IF state \\in {\"registered\", \"writing\"}\n                 THEN state' = \"waking\""),
     ("MCPark", "the worker parks without looking again after setting its bit", "Park.tla",
      "              /\\ wpc' = [wpc EXCEPT ![w] = IF work > 0 \\/ AllDone THEN \"clearown\" ELSE \"park\"]",
      "              /\\ wpc' = [wpc EXCEPT ![w] = \"park\"]"),
@@ -131,17 +137,227 @@ SLEEPING = 1 << 63
 CALLER = "ThreadId { task_id: main-thread(0) }"
 
 
-def record_finish(tree, build):
-    """Run tests/shuttle_finish.rs in `tree` (a checkout), building in
-    `build`: each schedule's log, a line a schedule."""
+def record(tree, build, test, variable):
+    """Run tests/`test`.rs in `tree` (a checkout), building in `build`,
+    with `variable` naming the file its schedules' logs go to: each
+    schedule's log, a line a schedule."""
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "trace")
-        env = dict(os.environ, FINISH_TRACE=out, RUSTFLAGS="--cfg shuttle", CARGO_TARGET_DIR=build)
-        r = subprocess.run(["cargo", "test", "-q", "--release", "--test", "shuttle_finish", "--", "--test-threads=1"],
+        env = dict(os.environ, RUSTFLAGS="--cfg shuttle", CARGO_TARGET_DIR=build, **{variable: out})
+        r = subprocess.run(["cargo", "test", "-q", "--release", "--test", test, "--", "--test-threads=1"],
                            cwd=os.path.join(tree, "threads"), env=env, capture_output=True, text=True)
         if r.returncode != 0:
-            sys.exit(f"check.py: tests/shuttle_finish.rs failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+            sys.exit(f"check.py: tests/{test}.rs failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
         return open(out).read().splitlines()
+
+
+def record_finish(tree, build):
+    return record(tree, build, "shuttle_finish", "FINISH_TRACE")
+
+
+def record_waker(tree, build):
+    return record(tree, build, "shuttle_waker", "WAKER_TRACE")
+
+
+def waker_trace(line):
+    """One schedule of tests/shuttle_waker.rs's first test as Waker.tla's
+    actions: the caller (the main thread) through Check, register's fast
+    path or loop, Recheck, the wait, clear; the worker (the thread that
+    sets `done`) and the other notifier through notify_after_seqcst and
+    wake_slow. A wake_slow that took no Waker wakes nothing: its Wake3
+    follows its store at once."""
+    events = [e.split("|") for e in line.split(";")]
+    workers = {t for (t, what, op, _) in events if what == "done" and op == "swap"}
+    others = sorted({t for (t, _, _, _) in events if t != CALLER and t not in workers})
+    number = {t: 0 for t in workers} | {t: k + 1 for k, t in enumerate(others)}
+    out, phase, nphase = [], "top", {}
+    act = lambda a: out.append(f'[a |-> "{a}"]')
+    for k, (thread, what, op, value) in enumerate(events):
+        if thread == CALLER:
+            if phase == "end":
+                continue
+            word = op.split()
+            if phase == "top" and what == "done":
+                act("Check")
+                if value == "true":
+                    act("Got"); phase = "end"
+                else:
+                    phase = "fast"
+            elif phase == "fast" and word[0] == "cas":
+                act("Fast"); phase = "compare" if word[1] == word[2] else "load"
+            elif phase == "compare" and what == "cell":
+                act("Compare"); phase = "fastback"
+            elif phase == "fastback" and word[0] == "store":
+                act("FastBack"); phase = "recheck"
+            elif phase == "load" and word[0] == "load":
+                act("Load"); phase = "cas" if word[1] in ("0", "2") else "load"
+            elif phase == "cas" and word[0] == "cas":
+                act("Cas"); phase = "put" if word[1] == word[2] else "load"
+            elif phase == "put" and what == "cell":
+                act("Put"); phase = "putback"
+            elif phase == "putback" and word[0] == "store":
+                act("PutBack"); phase = "recheck"
+            elif phase == "recheck" and what == "done":
+                act("Recheck"); phase = "clear" if value == "true" else "pending"
+            elif phase == "pending" and what == "woken":
+                if value == "true":
+                    act("Wake"); phase = "top"
+            elif phase == "clear" and word[0] == "load":
+                if word[1] == "0":
+                    act("Clear0"); act("Got"); phase = "end"
+                elif word[1] == "2":
+                    phase = "clearcas"
+                else:
+                    act("Clear0")   # spinning while another holds the slot
+            elif phase == "clearcas" and word[0] == "cas":
+                if word[1] == word[2]:
+                    act("Clear0"); phase = "clear1"
+                else:
+                    phase = "clear"
+            elif phase == "clear1" and what == "cell":
+                act("Clear1"); phase = "clear2"
+            elif phase == "clear2" and word[0] == "store":
+                act("Clear2"); act("Got"); phase = "end"
+            else:
+                sys.exit(f"check.py: the caller's {what} {op} {value} in phase {phase} is no Waker.tla action")
+        else:
+            n = number[thread]
+            nact = lambda a: out.append(f'[a |-> "{a}", n |-> {n}]')
+            word = op.split()
+            if what == "done" and op == "swap":
+                nact("Finish")
+            elif what == "state" and word[0] == "load":
+                nact("Notify")
+            elif what == "state" and word[0] == "cas":
+                nact("Wake0")
+            elif what == "cell":
+                nact("Wake1")
+            elif what == "state" and word[0] == "store":
+                nact("Wake2")
+                after = next(((w, o) for (t, w, o, _) in events[k + 1:] if t == thread), None)
+                if after != ("woken", "store"):
+                    nact("Wake3")
+            elif what == "woken" and op == "store":
+                nact("Wake3")
+            else:
+                sys.exit(f"check.py: a notifier's {what} {op} is no Waker.tla action")
+    return "<<" + ", ".join(out) + ">>"
+
+
+def record_park(tree, build):
+    return record(tree, build, "shuttle_park", "PARK_TRACE")
+
+
+def task(thread):
+    """A Shuttle thread's number (`main-thread(k)`)."""
+    return int(thread.rsplit("(", 1)[1].split(")")[0])
+
+
+def park_trace(line, fanout=1):
+    """One schedule of tests/shuttle_park.rs's owed_wakes_cascade as
+    Park.tla's actions: workers (tasks 1 to 3, bits 0 to 2) through
+    park_unless and pay_owed; the publisher (task 4) through its store and
+    wake_for. wake_one's loop is one step where it decides; a pay_owed that
+    has made its `fanout` wakes ends with no load, where the model reads
+    the owed word once more (a PayLoad that finds the fan-out spent)."""
+    events = [e.split("|") for e in line.split(";")]
+    out, phase, made, last_wake, owe_pending = [], {}, {}, None, False
+    act = lambda a, **kw: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f"{k} |-> {v}" for k, v in kw.items()]) + "]")
+
+    def wake(thread, word, mask_or_bits, before_or_none):
+        """A wake_one event: None while undecided, else the bit's worker (0: none)."""
+        if word[0] == "load":
+            return 0 if int(word[1]) == 0 else None
+        before, mask = int(word[1]), int(word[2])
+        bit = ~mask & ((1 << 64) - 1)
+        if before & bit:
+            return bit.bit_length()
+        return 0 if before & ~bit == 0 else None
+
+    for k, (thread, what, op) in enumerate(events):
+        n, word = task(thread), op.split()
+        if n == 4:
+            if what == "published":
+                act("Publish")
+            elif what == "word0" and not phase.get(4):
+                act("WakeFor"); phase[4] = "owe"
+                after = next(((w, o) for (t, w, o) in events[k + 1:] if task(t) == 4), None)
+                if not after or after[0] != "word1":
+                    act("WakeOwed"); phase[4] = "wake"
+            elif what == "word1":
+                if word[0] == "cas" and word[1] == word[2]:
+                    act("WakeOwed"); phase[4] = "wake"
+            elif what == "word0":
+                u = wake(thread, word, None, None)
+                if u is not None:
+                    act("WakeNow", u=u); last_wake = u
+            else:
+                sys.exit(f"check.py: the publisher's {what} {op} is no Park.tla action")
+            continue
+        w, p = n, phase.get(n, "setbit")
+        if p == "setbit" and what == "word0" and word[0] == "or":
+            act("SetBit", w=w); p = "visible"
+        elif p == "visible" and what == "published":
+            act("Visible", w=w); p = "clearown" if int(word[1]) > 0 else "park"
+        elif p == "clearown" and what == "word0" and word[0] == "and":
+            act("ClearOwn", w=w)
+            p = "end" if int(word[1]) & (1 << (w - 1)) else "passon"
+        elif p == "passon" and what == "word0":
+            u = wake(thread, word, None, None)
+            if u is not None:
+                act("PassOn", w=w, u=u); p = "pay"; made[w] = 0
+        elif p == "park" and what == "word0" and word[0] == "load":
+            act("ParkLoad", w=w)
+            if int(word[1]) & (1 << (w - 1)) == 0:
+                p = "pay"; made[w] = 0
+        elif p == "park" and what == "park":
+            act("ParkRet", w=w)
+        elif p == "pay" and what == "word1" and word[0] == "load":
+            act("PayLoad", w=w)
+            p = "paycas" if int(word[1]) & 0xFFFFFFFF and made[w] < fanout else "end"
+        elif p == "paycas" and what == "word1" and word[0] == "cas":
+            act("PayCas", w=w); p = "paywake" if word[1] == word[2] else "pay"
+        elif p == "paywake" and what == "word0":
+            u = wake(thread, word, None, None)
+            if u is not None:
+                act("PayWake", w=w, u=u)
+                if u == 0:
+                    p = "payclear"
+                else:
+                    made[w] += 1
+                    if made[w] >= fanout:
+                        act("PayLoad", w=w); p = "end"
+                    else:
+                        p = "pay"
+        elif p == "payclear" and what == "word1" and word[0] == "cas":
+            act("PayClear", w=w); p = "end"
+        else:
+            sys.exit(f"check.py: worker {w}'s {what} {op} in phase {p} is no Park.tla action")
+        phase[n] = p
+    if last_wake != 0:
+        act("WakeEnd")
+    return "<<" + ", ".join(out) + ">>"
+
+
+def check_park_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against Park.tla (three workers,
+    one wake a hop, one batch of three)."""
+    ts = {park_trace(line) for line in lines}
+    with tempfile.TemporaryDirectory() as d:
+        for f in os.listdir(models):
+            if f.endswith(".tla"):
+                shutil.copy(os.path.join(models, f), d)
+        with open(os.path.join(d, "ParkTraceBatches.tla"), "w") as f:
+            f.write("---- MODULE ParkTraceBatches ----\nOne == <<3>>\n====\n")
+        return check_traces(tla_jar, d, "ParkTrace", {"Workers = 3\n          Fanout = 1\n          Batches <- One\n          Leave = FALSE": (ts, len(lines))},
+                            extends="ParkTraceBatches")
+
+
+def check_waker_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against Waker.tla (one item, one
+    other notifier)."""
+    ts = {waker_trace(line) for line in lines}
+    return check_traces(tla_jar, models, "WakerTrace", {"Rounds = 1\n          Others = 1": (ts, len(lines))})
 
 
 def finish_trace(pieces, line):
@@ -188,60 +404,97 @@ def finish_trace(pieces, line):
     return "<<" + ", ".join(out) + ">>"
 
 
-def check_finish_traces(tla_jar, models, lines):
-    """Every distinct schedule in `lines` against Finish.tla as `models`
-    (a directory of the .tla files) states it: (passed, what TLC said)."""
-    traces = {}
-    for line in lines:
-        pieces, log = line.split("|", 1)
-        traces.setdefault(int(pieces), set()).add(finish_trace(int(pieces), log))
+def check_traces(tla_jar, models, spec, groups, extends=None):
+    """Every distinct trace against `spec` (FinishTrace, WakerTrace), with
+    `models` a directory of the .tla files. `groups` maps a configuration
+    (the CONSTANTS lines, a string) to (the traces' TLA+ sequences, how many
+    schedules gave them). (passed, what TLC said)."""
     said = []
     with tempfile.TemporaryDirectory() as d:
         for f in os.listdir(models):
             if f.endswith(".tla"):
                 shutil.copy(os.path.join(models, f), d)
-        for pieces, ts in sorted(traces.items()):
-            name = f"MCFinishTrace{pieces}"
+        for k, (constants, (ts, schedules)) in enumerate(sorted(groups.items())):
+            name = f"MC{spec}{k}"
             with open(os.path.join(d, name + ".tla"), "w") as f:
-                f.write(f"---- MODULE {name} ----\nEXTENDS FinishTrace\nMCTraces == <<\n" + ",\n".join(sorted(ts)) + "\n>>\n====\n")
+                f.write(f"---- MODULE {name} ----\nEXTENDS {spec}{', ' + extends if extends else ''}\nMCTraces == <<\n" + ",\n".join(sorted(ts)) + "\n>>\n====\n")
             with open(os.path.join(d, name + ".cfg"), "w") as f:
-                f.write(f"SPECIFICATION TSpec\nCONSTANTS Finishers = {pieces}\n          Target = {pieces}\n          Traces <- MCTraces\nINVARIANT Ends\n")
+                f.write(f"SPECIFICATION TSpec\nCONSTANTS {constants}\n          Traces <- MCTraces\nINVARIANT Ends\n")
             passed, out = tlc(tla_jar, d, name, deadlock=True)
             found = next((line for line in out.splitlines() if "Deadlock" in line or "violated" in line), "")
-            said.append(f"{pieces} finisher(s): {len(ts)} distinct schedules of {sum(1 for x in lines if x.startswith(f'{pieces}|'))}{', ' + found if found else ''}")
+            label = " ".join(constants.split())
+            said.append(f"{label}: {len(ts)} distinct of {schedules} schedules{', ' + found if found else ''}")
             if not passed:
                 return False, "; ".join(said) + "\n" + out[-2500:]
     return True, "; ".join(said)
 
 
-def trace_controls(tla_jar, lines):
-    """The trace check fails for a model narrowed past the code, and for
-    code the model does not follow: what each found (None: not caught)."""
-    import pipeline_model_controls
-    found = []
+def check_finish_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against Finish.tla."""
+    groups = {}
+    for line in lines:
+        pieces, log = line.split("|", 1)
+        ts, n = groups.get(f"Finishers = {pieces}\n          Target = {pieces}", (set(), 0))
+        ts.add(finish_trace(int(pieces), log))
+        groups[f"Finishers = {pieces}\n          Target = {pieces}"] = (ts, n + 1)
+    return check_traces(tla_jar, models, "FinishTrace", groups)
+
+
+def model_control(tla_jar, file, old, new, check, lines):
+    """The trace check of `lines` with `old` made `new` in a copy of the
+    models' `file`: (passed, what TLC said)."""
     with tempfile.TemporaryDirectory() as d:
         for f in os.listdir(HERE):
             if f.endswith(".tla"):
                 shutil.copy(os.path.join(HERE, f), d)
-        path = os.path.join(d, "Finish.tla")
+        path = os.path.join(d, file)
         text = open(path).read()
-        old = "Add(f) ==    /\\ fpc[f] = \"add\""
-        assert text.count(old) == 1, "the Add guard"
-        open(path, "w").write(text.replace(old, old + " /\\ ~sleeping"))
-        passed, said = check_finish_traces(tla_jar, d, lines)
-        found.append(("Finish.tla's Add allowed only with the bit clear (narrower than the code)", passed, said))
-    # The code: a copy of the tree in the build directory, never the tree.
+        if text.count(old) != 1:
+            sys.exit(f"check.py: the control's text is not in {file} once: {old!r}")
+        open(path, "w").write(text.replace(old, new))
+        return check(tla_jar, d, lines)
+
+
+def code_control(tla_jar, source, old, new, recorder, check):
+    """The trace check of the schedules recorded from a copy of the tree
+    (in the build directory, never the tree) with `old` made `new` in
+    `source`: (passed, what TLC said)."""
+    import pipeline_model_controls
     build = os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace-controls")
     tree = os.path.join(build, "tree")
     pipeline_model_controls.make_copy(tree)
-    path = os.path.join(tree, "threads", "src", "finish.rs")
+    path = os.path.join(tree, source)
     text = open(path).read()
-    old = "if before & SLEEPING != 0 && (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {"
-    assert text.count(old) == 1, "finished()'s condition"
-    open(path, "w").write(text.replace(old, "if (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {"))
-    passed, said = check_finish_traces(tla_jar, HERE, record_finish(tree, os.path.join(build, "target")))
-    found.append(("finish.rs's finished() unparks with no sleeper (the model does not)", passed, said))
-    return found
+    if text.count(old) != 1:
+        sys.exit(f"check.py: the control's text is not in {source} once: {old!r}")
+    open(path, "w").write(text.replace(old, new))
+    return check(tla_jar, HERE, recorder(tree, os.path.join(build, "target")))
+
+
+def trace_controls(tla_jar, finish_lines, waker_lines, park_lines):
+    """The trace checks fail for a model narrowed past the code, and for
+    code the model does not follow: (what, passed, what TLC said)."""
+    return [
+        ("Finish.tla's Add allowed only with the bit clear (narrower than the code)",
+         *model_control(tla_jar, "Finish.tla", 'Add(f) ==    /\\ fpc[f] = "add"', 'Add(f) ==    /\\ fpc[f] = "add" /\\ ~sleeping',
+                        check_finish_traces, finish_lines)),
+        ("finish.rs's finished() unparks with no sleeper (the model does not)",
+         *code_control(tla_jar, "threads/src/finish.rs",
+                       "if before & SLEEPING != 0 && (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {",
+                       "if (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {", record_finish, check_finish_traces)),
+        ("Waker.tla's notifiers notify only once the item is done (narrower than the code)",
+         *model_control(tla_jar, "Waker.tla", 'Notify(n) ==  /\\ npc[n] = "notify"', 'Notify(n) ==  /\\ npc[n] = "notify" /\\ done > 0',
+                        check_waker_traces, waker_lines)),
+        ("waker.rs's notify_after_seqcst() tries wake_slow whenever the slot is not IDLE (the model does not)",
+         *code_control(tla_jar, "threads/src/waker.rs", "if self.state.0.load(Ordering::SeqCst) == REGISTERED {",
+                       "if self.state.0.load(Ordering::SeqCst) != IDLE {", record_waker, check_waker_traces)),
+        ("Park.tla's payer reads the owed word only while something is owed (narrower than the code)",
+         *model_control(tla_jar, "Park.tla", 'PayLoad(w) == /\\ wpc[w] = "payload"', 'PayLoad(w) == /\\ wpc[w] = "payload" /\\ owedCount > 0',
+                        check_park_traces, park_lines)),
+        ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
+         *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
+                       "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
+    ]
 
 
 def main(argv):
@@ -272,13 +525,16 @@ def main(argv):
             print(f"control {model}: {what}: {'NOT CAUGHT' if passed else 'caught'} {found.strip()}", flush=True)
             if passed:
                 failed.append(f"control: {what}")
-    lines = record_finish(ROOT, os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace"))
-    passed, said = check_finish_traces(tla_jar, HERE, lines)
-    print(f"traces FinishTrace: {'PASS' if passed else 'FAIL'} {said}", flush=True)
-    if not passed:
-        failed.append("traces: FinishTrace")
+    build = os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace")
+    finish_lines, waker_lines, park_lines = record_finish(ROOT, build), record_waker(ROOT, build), record_park(ROOT, build)
+    for spec, check, lines in [("FinishTrace", check_finish_traces, finish_lines), ("WakerTrace", check_waker_traces, waker_lines),
+                               ("ParkTrace", check_park_traces, park_lines)]:
+        passed, said = check(tla_jar, HERE, lines)
+        print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
+        if not passed:
+            failed.append(f"traces: {spec}")
     if "--models" not in argv:
-        for what, passed, said in trace_controls(tla_jar, lines):
+        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines):
             print(f"control traces: {what}: {'NOT CAUGHT' if passed else 'caught'} {said.splitlines()[0]}", flush=True)
             if passed:
                 failed.append(f"control: {what}")
