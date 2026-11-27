@@ -866,6 +866,61 @@ fn lent_parts_and_a_group() {
     });
 }
 
+/// In two slots, a message lent short (in a group, published by the first
+/// wait) and one lent long (hashed in parts, whose last may come before or
+/// after the first event); their events, the owner waiting where none is ready; then
+/// a third message in a freed slot, aborted while empty, and its event. As
+/// tools/verify/tla/PipeSlots.tla has them: the scenario notes its own
+/// calls. Traced (PipeSlotsTrace.tla).
+fn messages_take_slots_and_come_out_in_end_order() {
+    check(|| {
+        trace::start("slots");
+        with_workers(2, || {
+            let (inputs, want) = inputs_of(&[100, 2 * lanes::TASK_LEN + 1]);
+            let mut pipe = Pipeline::<usize, ()>::new(Mode::Plain, Limits { messages: 2, rooms: 0 });
+            let mut guards: Vec<Option<pipeline::Lent<'_>>> = inputs.iter().map(|_| None).collect();
+            for (tag, bytes) in inputs.iter().enumerate() {
+                trace::note(&format!("message {tag}"));
+                let message = block_on(pipe.message(tag, None));
+                trace::note(&format!("lent {tag} {}", if bytes.len() > lanes::TASK_LEN { "long" } else { "short" }));
+                // Sound: `inputs` outlives the Pipeline and every guard.
+                guards[tag] = Some(unsafe { pipe.lent(message, bytes) });
+            }
+            let mut take = |pipe: &mut Pipeline<usize, ()>| loop {
+                match pipe.next_event() {
+                    Some(event) => {
+                        let tag = match event {
+                            Event::Hashed { tag, hash, .. } => {
+                                assert_eq!(hash, want[tag], "message {tag}'s digest");
+                                drop(guards[tag].take());
+                                tag
+                            }
+                            Event::Aborted { tag, .. } => tag,
+                            _ => panic!("an event of another kind"),
+                        };
+                        trace::note(&format!("event {tag}"));
+                        return;
+                    }
+                    None => {
+                        trace::note("ready");
+                        block_on(pipe.ready());
+                        trace::note("readied");
+                    }
+                }
+            };
+            take(&mut pipe);
+            take(&mut pipe);
+            trace::note("message 2");
+            let message = block_on(pipe.message(2, None));
+            trace::note("abort 2");
+            pipe.abort(message);
+            take(&mut pipe);
+            trace::note("finish");
+        });
+        trace::write();
+    });
+}
+
 /// Batches of short messages, a small one (one group's task) and one
 /// cut into several tasks, among single messages: each batch's digests
 /// are all written when its event comes.
@@ -997,7 +1052,7 @@ fn an_aborted_message_leaves_the_others_whole() {
 #[test]
 fn the_pipeline_under_shuttle() {
     blake3_servil_core::initialize();
-    let scenarios: [(&str, fn()); 12] = [
+    let scenarios: [(&str, fn()); 13] = [
         ("messages_through_rooms_complete_with_their_own_digests", messages_through_rooms_complete_with_their_own_digests),
         ("owned_messages_complete_and_wake_the_caller", owned_messages_complete_and_wake_the_caller),
         ("a_pipeline_after_another_reuses_its_storage_soundly", a_pipeline_after_another_reuses_its_storage_soundly),
@@ -1006,6 +1061,7 @@ fn the_pipeline_under_shuttle() {
         ("a_wait_for_a_room_ends_when_another_thread_drops_one", a_wait_for_a_room_ends_when_another_thread_drops_one),
         ("lent_messages_are_complete_when_their_events_come", lent_messages_are_complete_when_their_events_come),
         ("lent_parts_and_a_group", lent_parts_and_a_group),
+        ("messages_take_slots_and_come_out_in_end_order", messages_take_slots_and_come_out_in_end_order),
         ("an_aborted_message_leaves_the_others_whole", an_aborted_message_leaves_the_others_whole),
         ("short_messages_share_a_room_and_a_group", short_messages_share_a_room_and_a_group),
         ("batches_are_whole_when_their_events_come", batches_are_whole_when_their_events_come),

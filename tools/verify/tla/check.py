@@ -22,11 +22,12 @@ compare.
 Then the models are checked against the code (trace validation): the
 Shuttle tests of finish.rs, waker.rs (both), park.rs (owed_wakes_cascade)
 and the Pipeline (shuttle_pipeline.rs's wait for a Room, its lent parts
-and group, a storage outliving its Pipeline, and short messages sharing a
-Room) log every schedule, operation by operation, and each
+and group, a storage outliving its Pipeline, short messages sharing a
+Room, and messages through slots in end order) log every schedule, operation by operation, and each
 log, turned into its model's actions, must be a behavior of the model
 (FinishTrace.tla, WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla,
-PipeTasksTrace.tla, PipeStorageTrace.tla, PipeShortTrace.tla).
+PipeTasksTrace.tla, PipeStorageTrace.tla, PipeShortTrace.tla,
+PipeSlotsTrace.tla).
 
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
@@ -781,6 +782,79 @@ def check_short_traces(tla_jar, models, lines):
                         {"Msgs = 3\n          Rooms = 1\n          Credits = 3\n          Groups = 4\n          Members = 4": (ts, len(lines))})
 
 
+def slots_trace(line):
+    """One schedule of tests/shuttle_pipeline.rs's
+    messages_take_slots_and_come_out_in_end_order as PipeSlots.tla's
+    actions. The owner's steps are the scenario's notes of its own calls
+    (tag k is the model's message k + 1). A wait for events (`ready`) reaps
+    at the owner's first check after it (a load of `slot_done` or
+    `completed_epoch`), and waits if the end queue's front is not done
+    there: then, at its return, its wake and its poll again. To know which,
+    this follows the model's end queue (the messages ended in order, which
+    are done, how many reaped and taken). A message's tasks finish with its
+    `slot_done` swapped true (the owner's or a worker's: the owner runs
+    waiting actions itself in block_on), a group's with its
+    `completed_epoch`'s swap."""
+    events = [e.split("|") for e in line.split(";")]
+    out, slot_of, group = [], {}, {}
+    ended, done, reaped, taken, phase, checked = [], set(), 0, 0, "idle", False
+    act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
+    last = None
+    def reap():
+        nonlocal reaped
+        while reaped < len(ended) and ended[reaped] in done and reaped - taken < 2:
+            reaped += 1
+    def ready1():
+        nonlocal phase
+        act("Ready1"); reap(); act("Ready2")
+        phase = "idle" if reaped > taken else "readywait"
+    for k, (thread, s, a, op, old, new) in enumerate(events):
+        if s.startswith("shuttle_pipeline.rs"):
+            what, _, rest = op.partition(" ")
+            tag, _, kind = rest.partition(" ")
+            m = int(tag) + 1 if tag else 0
+            if what == "message":
+                act("Message1")
+            elif what == "lent":
+                # A publish inside lent() is push_member's own (its byte limit).
+                inside = next((e[3] for e in events[k + 1:] if e[1].startswith("shuttle_pipeline.rs")), None)
+                early = kind == "short" and inside == "publish"
+                act("Lent", m=m, long="TRUE" if kind == "long" else "FALSE", early="TRUE" if early else "FALSE")
+                ended.append(m); last = m
+            elif what == "abort":
+                act("Abort", m=m); ended.append(m); done.add(m)
+            elif what == "ready":
+                phase, checked = "ready", False
+            elif what == "readied":
+                if phase == "ready":
+                    ready1()
+                if phase == "readywait":
+                    act("ReadyWake"); ready1()
+            elif what == "event":
+                act("NextEvent")
+                if reaped == taken:
+                    reaped += 1
+                taken += 1
+            elif what == "finish":
+                act("Finish")
+        elif thread == CALLER and phase == "ready" and op == "load" and s in (SLOT_DONE, EPOCH):
+            ready1()
+        elif s == SLOT_DONE and op == "store" and new == "false" and thread == CALLER:
+            slot_of[a] = last
+        elif s == SLOT_DONE and op == "swap" and new == "true" and a in slot_of:
+            act("RunTasks", m=slot_of[a]); done.add(slot_of[a])
+        elif s == EPOCH and op == "swap":
+            act("RunGroup", g=group.setdefault(a, len(group) + 1))
+            done.update(m for m in ended if m not in slot_of.values())
+    return "<<" + ", ".join(out) + ">>"
+
+
+def check_slots_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against PipeSlots.tla (three messages, two slots)."""
+    ts = {slots_trace(line) for line in lines}
+    return check_traces(tla_jar, models, "PipeSlotsTrace", {"Msgs = 3\n          Slots = 2\n          Members = 2\n          Pieces = 2": (ts, len(lines))})
+
+
 def record_pipeline(tree, build):
     """tests/shuttle_pipeline.rs's traced scenarios' schedules: {name: lines},
     each atomic named (site_names)."""
@@ -919,6 +993,13 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
                        "        // Coalesce consecutive members sharing a Room into a single atomic subtraction.\n",
                        "        group.completed_epoch.swap(epoch, Ordering::SeqCst);\n        // Coalesce consecutive members sharing a Room into a single atomic subtraction.\n",
                        lambda tree, build: record_pipeline(tree, build)["short"], check_short_traces)),
+        ("PipeSlots.tla's ready() is called only with the end queue's front not done (narrower than the code)",
+         *model_control(tla_jar, "PipeSlots.tla", 'Ready1 == /\\ \\/ cpc = "idle" /\\ events = <<>>', 'Ready1 == /\\ \\/ cpc = "idle" /\\ events = <<>> /\\ ~FrontDone',
+                        check_slots_traces, pipeline["slots"])),
+        ("pipeline.rs's run_group completes its epoch twice (the model once)",
+         *code_control(tla_jar, "threads/src/pipeline.rs", "            group.completed_epoch.swap(epoch, Ordering::SeqCst);\n",
+                       "            group.completed_epoch.swap(epoch, Ordering::SeqCst);\n            group.completed_epoch.swap(epoch, Ordering::SeqCst);\n",
+                       lambda tree, build: record_pipeline(tree, build)["slots"], check_slots_traces)),
         ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
          *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
                        "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
@@ -960,7 +1041,8 @@ def main(argv):
                                ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline["room_wait"]),
                                ("PipeTasksTrace", check_tasks_traces, pipeline["lent_parts"]),
                                ("PipeStorageTrace", check_storage_traces, pipeline["storage"]),
-                               ("PipeShortTrace", check_short_traces, pipeline["short"])]:
+                               ("PipeShortTrace", check_short_traces, pipeline["short"]),
+                               ("PipeSlotsTrace", check_slots_traces, pipeline["slots"])]:
         passed, said = check(tla_jar, HERE, lines)
         print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
         if not passed:
