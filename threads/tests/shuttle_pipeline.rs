@@ -751,6 +751,39 @@ fn lent_messages_are_complete_when_their_events_come() {
     });
 }
 
+/// One message lent and hashed in three parts, then two short ones lent
+/// in one group: as tools/verify/tla/PipeTasks.tla has them. Each event's
+/// guard is dropped as it comes, the parted message's first. Traced
+/// (PipeTasksTrace.tla).
+fn lent_parts_and_a_group() {
+    check(|| {
+        trace::start("lent_parts");
+        with_workers(2, || {
+            let (inputs, want) = inputs_of(&[2 * lanes::TASK_LEN + 1, 100, 200]);
+            let mut pipe = Pipeline::<usize, ()>::new(Mode::Plain, Limits { messages: 3, rooms: 0 });
+            let mut guards: Vec<Option<pipeline::Lent<'_>>> = inputs.iter().map(|_| None).collect();
+            for (tag, bytes) in inputs.iter().enumerate() {
+                let message = block_on(pipe.message(tag, None));
+                // Sound: `inputs` outlives the Pipeline and every guard.
+                guards[tag] = Some(unsafe { pipe.lent(message, bytes) });
+            }
+            let mut left = inputs.len();
+            while left > 0 {
+                match pipe.next_event() {
+                    Some(Event::Hashed { tag, hash, .. }) => {
+                        assert_eq!(hash, want[tag], "message {tag}'s digest");
+                        drop(guards[tag].take().expect("an event once a message"));
+                        left -= 1;
+                    }
+                    Some(_) => panic!("an event that is no digest"),
+                    None => block_on(pipe.ready()),
+                }
+            }
+        });
+        trace::write();
+    });
+}
+
 /// Batches of short messages, a small one (one group's task) and one
 /// cut into several tasks, among single messages: each batch's digests
 /// are all written when its event comes.
@@ -882,13 +915,14 @@ fn an_aborted_message_leaves_the_others_whole() {
 #[test]
 fn the_pipeline_under_shuttle() {
     blake3_servil_core::initialize();
-    let scenarios: [(&str, fn()); 9] = [
+    let scenarios: [(&str, fn()); 10] = [
         ("messages_through_rooms_complete_with_their_own_digests", messages_through_rooms_complete_with_their_own_digests),
         ("owned_messages_complete_and_wake_the_caller", owned_messages_complete_and_wake_the_caller),
         ("a_pipeline_after_another_reuses_its_storage_soundly", a_pipeline_after_another_reuses_its_storage_soundly),
         ("a_room_outlives_its_pipeline", a_room_outlives_its_pipeline),
         ("a_wait_for_a_room_ends_when_another_thread_drops_one", a_wait_for_a_room_ends_when_another_thread_drops_one),
         ("lent_messages_are_complete_when_their_events_come", lent_messages_are_complete_when_their_events_come),
+        ("lent_parts_and_a_group", lent_parts_and_a_group),
         ("an_aborted_message_leaves_the_others_whole", an_aborted_message_leaves_the_others_whole),
         ("batches_are_whole_when_their_events_come", batches_are_whole_when_their_events_come),
         ("a_pipeline_with_no_pool_slot_does_its_own_work", a_pipeline_with_no_pool_slot_does_its_own_work),

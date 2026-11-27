@@ -980,8 +980,14 @@ polls a wait twice before it sleeps (`Repoll`, outside the fairness
 assumption), a re-check that finds a room free takes it before it
 clears the Waker, and the clear is a step of its own, so a notify can
 land between. A model whose waits poll again only once woken, and code
-whose Room drop wakes the owner on every drop, are each rejected. The
-other `Pipeline` models are not yet checked against the code (#31).
+whose Room drop wakes the owner on every drop, are each rejected.
+`PipeTasks.tla` is checked against `lent_parts_and_a_group`, a scenario
+written to its shape (a message lent in three parts, two short ones in
+one group; 7,000 schedules, about 70 distinct), after the same two
+corrections to its waits; a model whose parts count themselves off only
+once every part has written, and code whose every part (not only the
+last) wakes the owner, are each rejected. `PipeStorage`, `PipeSlots`,
+`PipeQueue` and `PipeShort` are not yet checked against the code (#31).
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.

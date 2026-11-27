@@ -21,10 +21,11 @@ compare.
 
 Then the models are checked against the code (trace validation): the
 Shuttle tests of finish.rs, waker.rs (both), park.rs (owed_wakes_cascade)
-and the Pipeline (shuttle_pipeline.rs's wait for a Room) log every
-schedule, operation by operation, and each log, turned into its model's
-actions, must be a behavior of the model (FinishTrace.tla,
-WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla).
+and the Pipeline (shuttle_pipeline.rs's wait for a Room, and its lent
+parts and group) log every schedule, operation by operation, and each
+log, turned into its model's actions, must be a behavior of the model
+(FinishTrace.tla, WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla,
+PipeTasksTrace.tla).
 
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
@@ -477,26 +478,39 @@ def finish_trace(pieces, line):
     return "<<" + ", ".join(out) + ">>"
 
 
-SRC = os.path.join(ROOT, "threads", "src")
-CREDITS = 1 << 30
+# The atomics trace validation knows, by name, and the source text of the
+# line that makes each (the shim logs that line: tests/shuttle_pipeline.rs).
+SITES = {
+    "refs": ("pipeline.rs", "refs: (0..count).map(|_| AtomicUsize::new(0)).collect(),"),
+    "done": ("pipeline.rs", "done: OwnLine(AtomicBool::new(true)),"),
+    "woken": ("pipeline.rs", "static BLOCK_ON_PARK: Arc<ThreadPark>"),
+    "state": ("waker.rs", "WakerSlot { state: Line(AtomicUsize::new(IDLE))"),
+    "tasks_left": ("pipeline.rs", "tasks_left: (0..m).map(|_| OwnLine(AtomicUsize::new(0))).collect(),"),
+    "slot_done": ("pipeline.rs", "slot_done: (0..m).map(|_| OwnLine(AtomicBool::new(true))).collect(),"),
+    "loan_completed": ("pipeline.rs", "loan_completed: (0..messages).map(|_| OwnLine(AtomicU64::new(0))).collect(),"),
+    "completed_epoch": ("pipeline.rs", "completed_epoch: OwnLine(AtomicU64::new(0)),"),
+}
+REFS, DONE, WOKEN, STATE = "refs", "done", "woken", "state"
+CREDITS = 1 << 30   # pipeline.rs's ROOM_CREDITS
+TASKS_LEFT, SLOT_DONE, LOAN, EPOCH = "tasks_left", "slot_done", "loan_completed", "completed_epoch"
 
-def site(file, text):
-    """Where in `file` (threads/src) the atomic `text` names is made: file:line."""
-    lines = open(os.path.join(SRC, file)).read().splitlines()
-    found = [k + 1 for k, l in enumerate(lines) if text in l]
-    if len(found) != 1:
-        sys.exit(f"check.py: {text!r} is not in {file} once")
-    return f"{file}:{found[0]}"
 
-REFS = site("pipeline.rs", "refs: (0..count).map(|_| AtomicUsize::new(0)).collect(),")
-DONE = site("pipeline.rs", "done: OwnLine(AtomicBool::new(true)),")
-WOKEN = site("pipeline.rs", "static BLOCK_ON_PARK: Arc<ThreadPark>")
-STATE = site("waker.rs", "WakerSlot { state: Line(AtomicUsize::new(IDLE))")
+def site_names(tree):
+    """{"file:line": name} for SITES, in `tree`'s threads/src (a planted
+    fault may move lines)."""
+    names = {}
+    for name, (file, text) in SITES.items():
+        lines = open(os.path.join(tree, "threads", "src", file)).read().splitlines()
+        found = [k + 1 for k, l in enumerate(lines) if text in l]
+        if len(found) != 1:
+            sys.exit(f"check.py: {text!r} is not in {file} once")
+        names[f"{file}:{found[0]}"] = name
+    return names
 
 def rooms_trace(line):
     """One schedule of tests/shuttle_pipeline.rs's
     a_wait_for_a_room_ends_when_another_thread_drops_one as PipeRooms.tla's
-    actions. The atomics are known by where pipeline.rs makes them (`site`):
+    actions. The atomics are known by where pipeline.rs makes them (SITES):
     a Room handed out is its count's store of all its credits; a commit, a
     piece's `done` stored false; a release (a worker's, or the owner's
     running an action itself), a subtraction of 1 from the count, its read
@@ -553,7 +567,8 @@ def rooms_trace(line):
             elif s == STATE and phase in ("roomclear", "eventclear") and ((op == "store" and new == "0") or (op == "load" and old == "0")):
                 act("Clear"); phase = "held" if phase == "roomclear" else "finished"
             elif s == STATE and op == "store" and old == "1" and new == "2" and phase in ("room", "events"):
-                out.insert(pending, '[a |-> "TakeRoom"]' if phase == "room" else '[a |-> "Events"]')
+                out.insert(len(out) if pending is None else pending, '[a |-> "TakeRoom"]' if phase == "room" else '[a |-> "Events"]')
+                pending = None
                 phase = "roomcheck" if phase == "room" else "eventcheck"
             elif s == DONE and op == "load" and phase in ("events", "eventcheck", "eventwait") and piece.get(a) == made:
                 if phase == "eventwait":
@@ -583,8 +598,78 @@ def rooms_trace(line):
     return "<<" + ", ".join(out) + ">>"
 
 
+
+
+def tasks_trace(line):
+    """One schedule of tests/shuttle_pipeline.rs's lent_parts_and_a_group as
+    PipeTasks.tla's actions. A part counts itself off (`tasks_left`'s
+    subtraction, its write just before); the part that counts the last off
+    folds and marks the loan (`loan_completed`'s store), then publishes the
+    slot (`slot_done` swapped true). The group's task completes its epoch
+    (`completed_epoch` swapped; its members hashed just before). The
+    owner's checks are the parted message's `slot_done` and the group's
+    `completed_epoch` against its epoch; its waits are as rooms_trace's; it
+    takes the message's event at its guard's drop (`loan_completed`'s load)
+    and the group's at the first short guard's (`completed_epoch`'s)."""
+    events = [e.split("|") for e in line.split(";")]
+    owner = CALLER
+    epoch = next(int(n) for (t, s, a, op, o, n) in events if s == EPOCH and op == "swap")
+    out, phase, pending, parts, part_of = [], "msg", None, 0, {}
+    act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
+    k = 0
+    while k < len(events):
+        thread, s, a, op, old, new = events[k]
+        k += 1
+        if s == TASKS_LEFT and op == "sub":
+            parts += 1; part_of[thread] = parts; act("Write", p=parts); act("Count", p=parts)
+        elif s == LOAN and op == "store":
+            p = part_of[thread]; act("Fold", p=p); act("Loan", p=p)
+        elif s == SLOT_DONE and op == "swap" and new == "true":
+            act("PublishSlot", p=part_of[thread])
+        elif s == EPOCH and op == "swap":
+            act("RunMembers"); act("Complete")
+        elif thread == owner and phase != "finished":
+            c = "msg" if phase.startswith("msg") else "group"
+            check = (s == SLOT_DONE and op == "load") if c == "msg" else (s == EPOCH and op == "load")
+            ready = (old == "true") if c == "msg" else (check and int(old) >= epoch)
+            if check and phase == c + "wait":
+                act("Repoll"); phase = c
+            if check and phase == c:
+                if ready:
+                    act("Wait"); phase = c + "take"
+                else:
+                    pending = len(out)
+            elif check and phase == c + "check":
+                act("Check"); phase = c + ("clear" if ready else "wait")
+            elif s == STATE and op == "store" and old == "1" and new == "2" and phase == c:
+                # At the failing check just before (none this poll: here).
+                out.insert(len(out) if pending is None else pending, '[a |-> "Wait"]'); phase = c + "check"; pending = None
+            elif s == STATE and phase == c + "clear" and ((op == "store" and new == "0") or (op == "load" and old == "0")):
+                act("Clear"); phase = c + "take"
+            elif s == WOKEN and op == "swap" and old == "true" and phase == c + "wait":
+                act("Woken"); phase = c
+            elif phase == "msgtake" and s == LOAN and op == "load":
+                act("TakeMsg"); phase = "group"
+            elif phase == "grouptake" and s == EPOCH and op == "load":
+                act("TakeGroup"); phase = "finished"
+    return "<<" + ", ".join(out) + ">>"
+
+
+def check_tasks_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against PipeTasks.tla (three parts, a group of two)."""
+    ts = {tasks_trace(line) for line in lines}
+    return check_traces(tla_jar, models, "PipeTasksTrace", {"Parts = 3\n          Members = 2": (ts, len(lines))})
+
+
 def record_pipeline(tree, build):
-    return [line.split(":", 1)[1] for line in record(tree, build, "shuttle_pipeline", "PIPELINE_TRACE") if line.startswith("room_wait:")]
+    """tests/shuttle_pipeline.rs's traced scenarios' schedules: {name: lines},
+    each atomic named (site_names)."""
+    names, traced = site_names(tree), {}
+    for line in record(tree, build, "shuttle_pipeline", "PIPELINE_TRACE"):
+        name, log = line.split(":", 1)
+        events = [e.split("|") for e in log.split(";")]
+        traced.setdefault(name, []).append(";".join("|".join([t, names.get(s, s), *rest]) for (t, s, *rest) in events))
+    return traced
 
 
 def check_rooms_traces(tla_jar, models, lines):
@@ -660,7 +745,7 @@ def code_control(tla_jar, source, old, new, recorder, check):
     return check(tla_jar, HERE, recorder(tree, os.path.join(build, "target")))
 
 
-def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline_lines):
+def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
     """The trace checks fail for a model narrowed past the code, and for
     code the model does not follow: (what, passed, what TLC said)."""
     return [
@@ -685,10 +770,19 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline_line
                         check_park_traces, park_lines)),
         ("PipeRooms.tla's waits poll again only once woken (narrower than the code: block_on polls twice)",
          *model_control(tla_jar, "PipeRooms.tla", 'Repoll ==     /\\ opc \\in {"roomwait", "eventwait"}',
-                        'Repoll ==     /\\ opc \\in {"roomwait", "eventwait"} /\\ woken', check_rooms_traces, pipeline_lines)),
+                        'Repoll ==     /\\ opc \\in {"roomwait", "eventwait"} /\\ woken', check_rooms_traces, pipeline["room_wait"])),
         ("pipeline.rs's Room::drop wakes the owner on every drop, not only the one that frees the room (the model does not)",
          *code_control(tla_jar, "threads/src/pipeline.rs", "        } else if prev == unused {\n            // Even if Pipeline::drop races",
-                       "        } else {\n            // Even if Pipeline::drop races", record_pipeline, check_rooms_traces)),
+                       "        } else {\n            // Even if Pipeline::drop races", lambda tree, build: record_pipeline(tree, build)["room_wait"],
+                       check_rooms_traces)),
+        ("PipeTasks.tla's parts count themselves off only once every part has written (narrower than the code)",
+         *model_control(tla_jar, "PipeTasks.tla", 'Count(p) ==   /\\ ppc[p] = "count"', 'Count(p) ==   /\\ ppc[p] = "count" /\\ \\A q \\in 1..Parts : written[q]',
+                        check_tasks_traces, pipeline["lent_parts"])),
+        ("pipeline.rs's run_multi_piece wakes the owner from every part, not only the last (the model does not)",
+         *code_control(tla_jar, "threads/src/pipeline.rs",
+                       "                self.slot_done[slot].swap(true, Ordering::SeqCst);\n            });\n        }\n    }\n}\n\n/// Settle the lazy merges",
+                       "                self.slot_done[slot].swap(true, Ordering::SeqCst);\n            });\n        } else {\n            storage.waker.notify_after_seqcst();\n        }\n    }\n}\n\n/// Settle the lazy merges",
+                       lambda tree, build: record_pipeline(tree, build)["lent_parts"], check_tasks_traces)),
         ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
          *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
                        "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
@@ -725,15 +819,16 @@ def main(argv):
                 failed.append(f"control: {what}")
     build = os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace")
     finish_lines, waker_lines, park_lines = record_finish(ROOT, build), record_waker(ROOT, build), record_park(ROOT, build)
-    pipeline_lines = record_pipeline(ROOT, build)
+    pipeline = record_pipeline(ROOT, build)
     for spec, check, lines in [("FinishTrace", check_finish_traces, finish_lines), ("WakerTrace", check_waker_traces, waker_lines),
-                               ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline_lines)]:
+                               ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline["room_wait"]),
+                               ("PipeTasksTrace", check_tasks_traces, pipeline["lent_parts"])]:
         passed, said = check(tla_jar, HERE, lines)
         print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
         if not passed:
             failed.append(f"traces: {spec}")
     if "--models" not in argv:
-        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline_lines):
+        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
             print(f"control traces: {what}: {'NOT CAUGHT' if passed else 'caught'} {said.splitlines()[0]}", flush=True)
             if passed:
                 failed.append(f"control: {what}")
