@@ -8,6 +8,21 @@ deciding where verification effort goes next.
 and what a run of every check found; this plan starts from its gaps (G1 to
 G7 there).
 
+## Where the stages stand
+
+As of November 27, 2026. Each stage's tracker issue holds its detail.
+
+| Stage | State | What landed |
+|---|---|---|
+| 1, the Lean definition as an oracle (#3) | done | `tools/verify/lean/Vectors.lean` writes `test_vectors/lean_vectors.json` (138 cases); every test that reads the official vectors reads it too: the `Hasher` (`test_vectors/`), the throughput and multithreaded calls (`threads/tests/vectors.rs`), the `Pipeline` (`pipeline_pool.rs`), the C API and `b3sum` |
+| 2, theorems about the algorithms (#4) | done | `tools/verify/lean/Algorithms.lean`: the incremental stack, cut and merge, rows, extended output, outboard and counters, each equal to the definition; `Pieces.lean` the `Pipeline`'s lazy fold of piece values (#21); `Credits.lean` a room's credit count at its real size (#19) |
+| 3, the thread protocols in TLA+ (#5) | done | `tools/verify/tla/`: the three handshakes, round-robin turns, and six models of the `Pipeline`, each with controls; the handshakes' models checked against Shuttle's schedules of the code (trace validation, #22). Left: trace validation of the `Pipeline` models and the waker's fast path (#31) |
+| 4, weak memory (#6) | open | |
+| 5, `b3sum` in TLA+ (#7) | open | |
+| 6, the kernels' callers (#8) | waiting on its decision | |
+| 7, hax (#9) | open | |
+| 8, one kernel proof in Lean (#10) | open | |
+
 ## Where the plan starts
 
 Today the chain from BLAKE3's text to the shipped code is:
