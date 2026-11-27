@@ -889,7 +889,25 @@ one slot and four, where `message()`'s refusal for untaken events is
 met. Six faults fail it: events taken out of end order, an aborted
 slot freed before its group finishes, a slot freed when its message is
 ended rather than at its event, either wait without its refusal, and a
-wait that does not publish the front's group. `Turn.tla` states
+wait that does not publish the front's group. `PipeQueue.tla` states
+the Pipeline's source (`lanes.rs`, `Source`): actions published into
+a ring under its assert, taken by compare-and-swap by workers and by
+the owner itself (in `block_on`, and in its spins for a piece node or
+a group), the wakes (where two or more wait, `serve`'s chain, and
+`wake_for_waiting` before the owner sleeps), and the rings the owner
+takes from and gives back to (`free_slots`, `free_pieces`,
+`local_free_rooms`). No ring is pushed past its capacity, which are
+the code's (the action ring's `m * MAX_SLOT_PIECES + p_cap + g_cap`
+holds every action not yet taken, for the three kinds of owner each
+used to its bound); each action is run once and is the one published
+at its number; the owner never sleeps on waiting actions with every
+worker parked; and every action is run and the owner finishes. Six
+faults fail it: a claim that does not compare `claimed` (an action
+taken twice), a wait without `wake_for_waiting`, and each of the four
+rings one short (the action ring's met in a smaller instance whose
+owner can fill it). The code's own use is tighter (a slot is used one
+way, and a short Room's piece shares its Room), so its queue holds
+fewer than the ring. `Turn.tla` states
 how workers choose among the registered sources (`lanes.rs`,
 `run_one`): lowest slot first, and every `TURN` items one in turn from
 a cursor that moves past the slot served. Beside a Pipeline that streams

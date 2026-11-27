@@ -8,8 +8,9 @@ The models (Finish.tla, Waker.tla, Park.tla) state threads/src/finish.rs,
 waker.rs and park.rs one atomic operation an action, and PipeRooms.tla,
 PipeTasks.tla and PipeStorage.tla the Pipeline's (pipeline.rs) rooms and
 their credits, messages hashed in parts, loans and groups, a storage
-outliving its Pipeline, and PipeSlots.tla its message slots and the order
-of their events, and Turn.tla the workers' choice among sources
+outliving its Pipeline, PipeSlots.tla its message slots and the order of
+their events, and PipeQueue.tla its source's action queue and its rings,
+and Turn.tla the workers' choice among sources
 (lanes.rs, run_one), and TLC checks every
 schedule of a small instance: the safety properties as invariants, and that
 no wake is lost as a liveness property under weak fairness, which Shuttle's
@@ -51,7 +52,7 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "Turn"]
+MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "Turn"]
 
 # (model, what the fault is, file, text to find once, its replacement, ...more
 # pairs of text and replacement for a fault that moves a step). The
@@ -111,6 +112,16 @@ CONTROLS = [
      "IF Len(events) >= Slots \\/ OpenCount >= Slots", "IF OpenCount >= Slots"),
     ("PipeSlots", "a wait does not publish the open group the end queue's front is in", "PipeSlots.tla",
      "PublishIfFront == IF FrontInOpen THEN", "PublishIfFront == IF FALSE THEN"),
+    ("PipeQueue", "a taker claims its action without comparing claimed (taken twice)", "PipeQueue.tla",
+     "Won(t) == claimed + 1 = take[t].n", "Won(t) == take[t].n # 0"),
+    ("PipeQueue", "a wait sleeps without wake_for_waiting", "PipeQueue.tla",
+     "/\\ IF Waiting > 0 THEN Wake ELSE UNCHANGED wpc        \\* wake_for_waiting", "/\\ UNCHANGED wpc"),
+    ("MCPipeQueueFull", "the action ring is one short of what is handed out", "PipeQueue.tla",
+     "ActionRing == Slots * MaxPieces + Nodes + Groups", "ActionRing == Slots * MaxPieces + Nodes + Groups - 1"),
+    ("PipeQueue", "free_pieces is one short of the nodes", "PipeQueue.tla", "PieceRing == Nodes", "PieceRing == Nodes - 1"),
+    ("PipeQueue", "free_slots is one short of the slots", "PipeQueue.tla", "SlotRing == Slots", "SlotRing == Slots - 1"),
+    ("PipeQueue", "local_free_rooms is one short of the rooms", "PipeQueue.tla",
+     "RoomRing == IF Rooms > 1 THEN Rooms ELSE 1", "RoomRing == Rooms - 1"),
     ("Turn", "every walk starts at slot 0 (no turns: a streaming Pipeline starves the rest)", "Turn.tla",
      "      start == IF inTurn THEN cursor[w] ELSE 1", "      start == 1"),
     ("Turn", "a turn's cursor stays on the slot it served", "Turn.tla",
