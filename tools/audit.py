@@ -75,7 +75,7 @@ CHECKS = [
     check("shuttle", "Thread schedules", f"RUSTFLAGS='--cfg shuttle' cargo test --release {SHUTTLE}", cwd="threads"),
     check("pipeline_controls", "Thread schedules", "python3 tools/pipeline_model_controls.py", minutes=60),
     check("waker_order", "Thread schedules", "python3 tools/check-waker-order.py", ["target:aarch64-apple-darwin"]),
-    check("tla_models", "Thread schedules", "python3 tools/verify/tla/check.py", ["cmd:java"], minutes=30),
+    check("tla_models", "Thread schedules", "python3 tools/verify/tla/check.py", ["cmd:java", "cmd:cargo"], minutes=30),
     check("b3sum_controls", "b3sum I/O", "python3 tools/b3sum_controls.py", [NEXTEST], minutes=60),
     prove("prove_hybrid", "prove_hybrid.py", [ARM_AS]),
     prove("prove_sme2", "prove_sme2.py chunks chunks_at messages parents xof chunks_x2 every parents_every xof_every "

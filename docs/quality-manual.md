@@ -892,7 +892,16 @@ Dropping the owed word's generation bump (ABA) is not caught:
 the schedule needs a payer's two compare-and-swaps to straddle a
 publisher's add and equal payments by others, past these instances;
 Shuttle's `coincident_publishers_and_payers_keep_fresh_fanout` covers
-it. The models are not the code; Shuttle runs the code.
+it. The models are not the code; Shuttle runs the code. For the finish
+line the two are tied: `tests/shuttle_finish.rs` logs each operation
+`finish.rs` makes (its primitives log from inside Shuttle's own atomic
+step, so the log's order is the operations'), and `check.py` checks every
+schedule Shuttle runs (9,000; 15 distinct) is a behavior of `Finish.tla`
+(`FinishTrace.tla`, a trace a deadlock where the model cannot take it).
+A model narrowed past the code (`Add` only with the bit clear) and code
+the model does not follow (`finished()` unparking with no sleeper, in a
+copy of the tree) are each rejected. The waker slot's and the park's
+traces are not yet checked.
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
