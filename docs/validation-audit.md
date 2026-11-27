@@ -108,6 +108,25 @@ by number.
   have controls; the file-end and `io_uring` state machines have tests and
   no model.
 
+## Since this audit
+
+The results above are of the audited commit. Since it, stages 1 to 3 of
+the plan have landed ([`validation-plan.md`](validation-plan.md#where-the-stages-stand)):
+
+- **G1 is closed** for the lengths tried: `test_vectors/lean_vectors.json`,
+  written by the Lean definition, is read by every test that reads the
+  official vectors (`lean_vectors`).
+- **G2 is closed** for the algorithms as written in Lean
+  (`tools/verify/lean/Algorithms.lean`, `Pieces.lean`). That the Rust
+  implements them still rests on tests.
+- **G5 is closed** for the models: TLC checks every schedule of small
+  instances of the handshakes, the `Pipeline` and round-robin service, with
+  liveness, and each model fails for its planted faults (`tla_models`).
+  The handshakes' models are checked against Shuttle's schedules of the
+  code; the `Pipeline`'s are not yet (#31).
+
+G3, G4, G6 and G7 stand as written.
+
 ## Findings from this run
 
 1. **The documented `b3sum` test command fails.** `QUALITY.md` and the
