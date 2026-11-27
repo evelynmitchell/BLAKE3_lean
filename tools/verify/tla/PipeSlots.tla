@@ -135,7 +135,7 @@ MessageWake == /\ cpc = "messagewait" /\ FrontDone /\ cpc' = "message"
 \* ready(): reap; return with an event, else panic with nothing ended in
 \* flight, else publish the front's open group and wait. The caller awaits it
 \* where next_event gave none.
-Ready1 == /\ \/ cpc = "idle" /\ events = <<>> /\ ~FrontDone
+Ready1 == /\ \/ cpc = "idle" /\ events = <<>>
              \/ cpc = "ready"
           /\ Reap /\ cpc' = "ready2"
           /\ UNCHANGED <<ended, taken, opened, work>>
@@ -192,13 +192,13 @@ Abort(s) == LET x == slot[s]  m == x.msg IN
     /\ UNCHANGED <<grp, openG, nextG, mgroup, mwork, pieces, made>>
 \* owned and lent (submit_slice): a short slice is a group member, a long
 \* one the slot's tasks.
-Slice(s) == LET m == slot[s].msg IN
+SliceE(s, long, early) == LET m == slot[s].msg IN
     /\ slot[s].kind = "OpenEmpty"
-    /\ \/ \E early \in BOOLEAN :
-            /\ SetGroups(Push(Groups, m, "short", FALSE, early)) /\ mgroup' = [mgroup EXCEPT ![m] = Into(Groups, "short")]
+    /\ IF long THEN Hand(s, "WaitMulti", 0, "Hashed") /\ mwork' = [mwork EXCEPT ![m] = "run"] /\ UNCHANGED <<grp, openG, nextG, mgroup>>
+       ELSE /\ SetGroups(Push(Groups, m, "short", FALSE, early)) /\ mgroup' = [mgroup EXCEPT ![m] = Into(Groups, "short")]
             /\ Hand(s, "WaitSingle", Into(Groups, "short"), "Hashed") /\ UNCHANGED mwork
-       \/ Hand(s, "WaitMulti", 0, "Hashed") /\ mwork' = [mwork EXCEPT ![m] = "run"] /\ UNCHANGED <<grp, openG, nextG, mgroup>>
     /\ UNCHANGED <<pieces, made, credit>>
+Slice(s) == \E long, early \in BOOLEAN : SliceE(s, long, early)
 \* batch: of no messages (done at once), small (a group member), or large.
 Batch(s) == LET m == slot[s].msg IN
     /\ slot[s].kind = "OpenEmpty"

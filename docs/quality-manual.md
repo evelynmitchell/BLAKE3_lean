@@ -1002,9 +1002,17 @@ the Room's count and the groups' epochs come from the atomics. The
 traces showed the model lacked that byte limit: a group is now published
 full, past it (a choice), or by a wait. A model without it, and code
 whose group task completes its epoch before it gives its members'
-credits back, are each rejected. `PipeSlots` and `PipeQueue` are not yet
-checked against the code (#31); `PipeQueue`'s queue is `lanes.rs`'s
-`Source`, which `shuttle_pipeline.rs` replaces with a stand-in.
+credits back, are each rejected. `PipeSlots.tla` is checked against
+`messages_take_slots_and_come_out_in_end_order` (in two slots, a short
+lent message in a group and a long one in parts; their events through
+waits; then a third message in a freed slot, aborted while empty; 7,000
+schedules, 6 distinct), the scenario's notes giving the owner's calls.
+The traces showed the model's `ready()` refused a call whose front was
+already done, which the code allows; a model with that refusal, and code
+whose group task completes its epoch twice, are each rejected.
+`PipeQueue` is not checked against the code (#31): its queue is
+`lanes.rs`'s `Source`, which `shuttle_pipeline.rs` replaces with a
+stand-in, and no Shuttle test runs the real one.
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
