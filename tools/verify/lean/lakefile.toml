@@ -1,5 +1,5 @@
 name = "Blake3Servil"
-defaultTargets = ["Generic", "Bridge", "Term", "Sound", "Algorithms", "Credits"]
+defaultTargets = ["Generic", "Bridge", "Term", "Sound", "Algorithms", "Credits", "Pieces"]
 
 [[require]]
 name = "Blake3"
@@ -24,6 +24,10 @@ name = "Algorithms"
 # A Pipeline room's credit count at its real size (threads/src/pipeline.rs).
 [[lean_lib]]
 name = "Credits"
+
+# The Pipeline's folding of piece values (threads/src/pipeline.rs).
+[[lean_lib]]
+name = "Pieces"
 
 # test_vectors/lean_vectors.json (Vectors.lean): compiled, since the interpreter takes
 # minutes over the inputs.

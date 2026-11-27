@@ -959,6 +959,17 @@ these model tests are run with Shuttle's own scheduling.
   that skips a real parent or writes the right subtree first, a layer
   that passes its last value up where it merges, and a proof replaced
   by `sorry` each fail the build.
+- **Lean proof of the Pipeline's fold of piece values**
+  (`tools/verify/lean/Pieces.lean`, built by `emit.py`): `merge_pieces`,
+  `push_piece`, `finish_pieces` and `fold_multi_cvs`, the lazy stack
+  that settles its merges by the count's 1-bits before each push, give
+  the definition's tree for every message cut into pieces of `2^b`
+  chunks (a part of a message hashed in parts; a Room, whose first piece
+  gives its two halves). Settled, the lazy stack is the eager stack's
+  subtrees (`merge_lazy`, from `push_subtrees` and the stacks' lengths).
+  A settle one merge short and a finish folding bottom first each fail
+  the build; in the Rust, the first Room pushed as its left half and
+  `merge_pieces` one merge short each fail the Lean-vector tests.
 - **Lean proof of a Pipeline room's credit count**
   (`tools/verify/lean/Credits.lean`, built by `emit.py`): each step on a
   room's count (`init_taken`, `take_credit` with its renewal at
