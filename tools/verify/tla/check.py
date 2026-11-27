@@ -7,8 +7,9 @@
 The models (Finish.tla, Waker.tla, Park.tla) state threads/src/finish.rs,
 waker.rs and park.rs one atomic operation an action, and PipeRooms.tla,
 PipeTasks.tla and PipeStorage.tla the Pipeline's (pipeline.rs) rooms and
-their credits, messages hashed in parts, loans and groups, and a storage
-outliving its Pipeline, and Turn.tla the workers' choice among sources
+their credits, messages hashed in parts, loans and groups, a storage
+outliving its Pipeline, and PipeSlots.tla its message slots and the order
+of their events, and Turn.tla the workers' choice among sources
 (lanes.rs, run_one), and TLC checks every
 schedule of a small instance: the safety properties as invariants, and that
 no wake is lost as a liveness property under weak fairness, which Shuttle's
@@ -50,7 +51,7 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "Turn"]
+MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "Turn"]
 
 # (model, what the fault is, file, text to find once, its replacement, ...more
 # pairs of text and replacement for a fault that moves a step). The
@@ -96,6 +97,20 @@ CONTROLS = [
      "/\\ ppc' = [ppc EXCEPT ![p] = \"loan\"]", "/\\ ppc' = [ppc EXCEPT ![p] = \"publish\"]",
      "/\\ loanDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"publish\"]", "/\\ loanDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"end\"]",
      "/\\ slotDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"end\"]", "/\\ slotDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"loan\"]"),
+    ("PipeSlots", "next_event takes any done slot's event, not the end queue's front's", "PipeSlots.tla",
+     "ELSE LET s == Head(endq) IN\n                     /\\ endq # <<>> /\\ Done(s) /\\ taken' = Append(taken, Event(s))\n                     /\\ endq' = Tail(endq)",
+     "ELSE \\E i \\in 1..Len(endq) : LET s == endq[i] IN\n                     /\\ endq # <<>> /\\ Done(s) /\\ taken' = Append(taken, Event(s))\n                     /\\ endq' = SubSeq(endq, 1, i - 1) \\o SubSeq(endq, i + 1, Len(endq))"),
+    ("PipeSlots", "an aborted slot is freed before its group finishes (WaitAborted)", "PipeSlots.tla",
+     '[] x.kind = "WaitAborted" -> pieces[m] = 0 /\\ GroupDone(x.group)', '[] x.kind = "WaitAborted" -> pieces[m] = 0'),
+    ("PipeSlots", "a slot goes back on the free list when its message is ended, before its event", "PipeSlots.tla",
+     "             /\\ UNCHANGED <<free, events, taken, opened, cpc>>",
+     "             /\\ free' = IF slot'[s].kind \\in Wait THEN Append(free, s) ELSE free\n             /\\ UNCHANGED <<events, taken, opened, cpc>>"),
+    ("PipeSlots", "ready() waits with nothing ended in flight (no refusal)", "PipeSlots.tla",
+     "ELSE IF endq = <<>> THEN cpc' = \"panicked\"", "ELSE IF endq = <<>> THEN cpc' = \"readywait\""),
+    ("MCPipeSlotsOne", "message() waits with every event untaken (no refusal)", "PipeSlots.tla",
+     "IF Len(events) >= Slots \\/ OpenCount >= Slots", "IF OpenCount >= Slots"),
+    ("PipeSlots", "a wait does not publish the open group the end queue's front is in", "PipeSlots.tla",
+     "PublishIfFront == IF FrontInOpen THEN", "PublishIfFront == IF FALSE THEN"),
     ("Turn", "every walk starts at slot 0 (no turns: a streaming Pipeline starves the rest)", "Turn.tla",
      "      start == IF inTurn THEN cursor[w] ELSE 1", "      start == 1"),
     ("Turn", "a turn's cursor stays on the slot it served", "Turn.tla",
