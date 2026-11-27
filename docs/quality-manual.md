@@ -876,7 +876,16 @@ finds its loan complete), and `PipeStorage.tla` a storage outliving
 its Pipeline (on the free list only once no Pipeline or Room holds it,
 and once; the next Pipeline never hands out a surviving Room's room),
 each with liveness: the owner makes every commit and takes every
-event, and the storage goes back on the free list.
+event, and the storage goes back on the free list. `Turn.tla` states
+how workers choose among the registered sources (`lanes.rs`,
+`run_one`): lowest slot first, and every `TURN` items one in turn from
+a cursor that moves past the slot served. Beside a Pipeline that streams
+in the lowest slot (always an item), every item waiting in the others is
+taken (five sources, three workers, `TURN` 4). A walk always from slot
+0, and a cursor that stays on the slot it served, each starve a source
+and fail it. Never resetting the count after a turn passes, as it
+should: every walk is then in turn, round-robin, which starves no one
+and is the slower policy #241 measured.
 Each of `tools/pipeline_model_controls.py`'s ten faults is planted in
 them too (5 and 10 are one mechanism there), and TLC rejects each.
 Dropping the owed word's generation bump (ABA) is not caught:

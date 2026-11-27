@@ -8,7 +8,8 @@ The models (Finish.tla, Waker.tla, Park.tla) state threads/src/finish.rs,
 waker.rs and park.rs one atomic operation an action, and PipeRooms.tla,
 PipeTasks.tla and PipeStorage.tla the Pipeline's (pipeline.rs) rooms and
 their credits, messages hashed in parts, loans and groups, and a storage
-outliving its Pipeline, and TLC checks every
+outliving its Pipeline, and Turn.tla the workers' choice among sources
+(lanes.rs, run_one), and TLC checks every
 schedule of a small instance: the safety properties as invariants, and that
 no wake is lost as a liveness property under weak fairness, which Shuttle's
 sampled schedules cannot state. They model the code; they are not it. The
@@ -43,7 +44,7 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage"]
+MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "Turn"]
 
 # (model, what the fault is, file, text to find once, its replacement, ...more
 # pairs of text and replacement for a fault that moves a step). The
@@ -89,6 +90,10 @@ CONTROLS = [
      "/\\ ppc' = [ppc EXCEPT ![p] = \"loan\"]", "/\\ ppc' = [ppc EXCEPT ![p] = \"publish\"]",
      "/\\ loanDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"publish\"]", "/\\ loanDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"end\"]",
      "/\\ slotDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"end\"]", "/\\ slotDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"loan\"]"),
+    ("Turn", "every walk starts at slot 0 (no turns: a streaming Pipeline starves the rest)", "Turn.tla",
+     "      start == IF inTurn THEN cursor[w] ELSE 1", "      start == 1"),
+    ("Turn", "a turn's cursor stays on the slot it served", "Turn.tla",
+     "cursor' = [cursor EXCEPT ![w] = (s % Sources) + 1]", "cursor' = [cursor EXCEPT ![w] = s]"),
 ]
 
 
