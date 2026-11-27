@@ -992,8 +992,19 @@ three Rooms dropped while two are alive on threads of their own, then
 the next Pipeline of its size; 7,000 schedules, about 35 distinct) as it
 was: a model whose surviving Rooms drop only once `Pipeline::drop` has
 begun, and a drop that gives back an unheld room's hold as it clears
-the room's count, are each rejected. `PipeSlots`, `PipeQueue` and
-`PipeShort` are not yet checked against the code (#31).
+the room's count, are each rejected. `PipeShort.tla` is checked
+against `short_messages_share_a_room_and_a_group` (three short messages
+from one Room, one past `push_member`'s byte limit so its group goes to
+the workers while the rest are written, one aborted while open; 7,000
+schedules, 6 distinct): slot kinds and groups are not atomics, so the
+scenario notes its own calls and the stand-in pool each publication, and
+the Room's count and the groups' epochs come from the atomics. The
+traces showed the model lacked that byte limit: a group is now published
+full, past it (a choice), or by a wait. A model without it, and code
+whose group task completes its epoch before it gives its members'
+credits back, are each rejected. `PipeSlots` and `PipeQueue` are not yet
+checked against the code (#31); `PipeQueue`'s queue is `lanes.rs`'s
+`Source`, which `shuttle_pipeline.rs` replaces with a stand-in.
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.

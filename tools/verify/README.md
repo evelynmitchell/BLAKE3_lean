@@ -14,7 +14,7 @@ Commands:
     python3 tools/verify/cross_check.py                 # the NEON and integer models against the CPU
     python3 tools/verify/cross_check_sme.py             # the streaming SVE and SME2 models against the CPU (needs SME2)
     python3 tools/verify/mutants.py                     # wrong kernels are rejected
-    python3 tools/verify/tla/check.py                   # the pool's handshakes and the Pipeline in TLA+, every schedule of small instances, and thirty-four planted faults; then Shuttle's schedules of finish.rs, waker.rs, park.rs and the Pipeline's Rooms, parted messages and storages checked as behaviors of their models, and thirteen controls (needs Java and Rust; minutes)
+    python3 tools/verify/tla/check.py                   # the pool's handshakes and the Pipeline in TLA+, every schedule of small instances, and thirty-four planted faults; then Shuttle's schedules of finish.rs, waker.rs, park.rs and the Pipeline's Rooms, parted messages, storages and short messages checked as behaviors of their models, and fifteen controls (needs Java and Rust; minutes)
     python3 -m unittest discover -s tools/verify -p 'test_*.py'  # proof helpers and fail-stop worker controls
     python3 tools/verify/isla_check.py                  # the NEON and integer models against Arm's specification (needs Isla)
     python3 tools/verify/prove_x86.py [CASE...]         # the x86-64 kernels: compressions, hash_many at fixed counts, xof_many, the chunk root, the partial pass and the wide kernels (390 cases; --representative: 203 of them)

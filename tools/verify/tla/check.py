@@ -22,10 +22,11 @@ compare.
 Then the models are checked against the code (trace validation): the
 Shuttle tests of finish.rs, waker.rs (both), park.rs (owed_wakes_cascade)
 and the Pipeline (shuttle_pipeline.rs's wait for a Room, its lent parts
-and group, and a storage outliving its Pipeline) log every schedule, operation by operation, and each
+and group, a storage outliving its Pipeline, and short messages sharing a
+Room) log every schedule, operation by operation, and each
 log, turned into its model's actions, must be a behavior of the model
 (FinishTrace.tla, WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla,
-PipeTasksTrace.tla, PipeStorageTrace.tla).
+PipeTasksTrace.tla, PipeStorageTrace.tla, PipeShortTrace.tla).
 
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
@@ -717,6 +718,69 @@ def check_storage_traces(tla_jar, models, lines):
     return check_traces(tla_jar, models, "PipeStorageTrace", {"Rooms = 3\n          Survivors = 2": (ts, len(lines))})
 
 
+def short_trace(line):
+    """One schedule of tests/shuttle_pipeline.rs's
+    short_messages_share_a_room_and_a_group as PipeShort.tla's actions. The
+    owner's steps are the scenario's notes of its own calls (a commit, an
+    end, an abort, the Room's drop, an event taken, the Pipeline's drop:
+    tag k is the model's message k + 1) and the stand-in pool's note of
+    each action published (publish_open); its Room is its count's store of
+    all its credits. A group's task gives its members' credits back (a
+    subtraction from the count, its hashing just before) and completes its
+    epoch (`completed_epoch`'s swap); groups are numbered in the order they
+    are first seen."""
+    events = [e.split("|") for e in line.split(";")]
+    owner = CALLER
+    out, group, early, owed = [], {}, set(), False
+    act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
+    def group_of(a):
+        return group.setdefault(a, len(group) + 1)
+    for k, (thread, s, a, op, old, new) in enumerate(events):
+        if s.startswith("shuttle_pipeline.rs"):
+            what, _, tag = op.partition(" ")
+            m = int(tag) + 1 if tag else 0
+            if what == "commit":
+                act("Commit")
+            elif what == "end":
+                # A publish inside end() is push_member's own (its byte limit).
+                inside = next((k2 for k2 in range(k + 1, len(events)) if events[k2][1].startswith("shuttle_pipeline.rs")), None)
+                if inside is not None and events[inside][3] == "publish":
+                    early.add(inside)
+                act("OnMsg", m=m, early="TRUE" if inside in early else "FALSE")
+            elif what == "abort":
+                act("AbortShort", m=m); owed = True
+            elif what == "droproom":
+                act("DropRoom"); owed = True
+            elif what == "publish" and k not in early:
+                act("PublishOpen")
+            elif what == "event":
+                act("Event", m=m)
+            elif what == "drop":
+                act("DropPipeline")
+                break
+        elif s == REFS and op == "store" and new == str(CREDITS) and thread == owner:
+            act("TakeRoom")
+        elif s == REFS and op == "sub" and thread == owner and owed:
+            owed = False   # the abort's, or the Room's drop's, own subtraction
+        elif s == REFS and op == "sub":
+            # A group's release, on a worker or on the owner running its task
+            # itself: the thread's next swap of an epoch is that group's.
+            g = group_of(next(a2 for (t2, s2, a2, op2, o2, n2) in events[k + 1:] if t2 == thread and s2 == EPOCH and op2 == "swap"))
+            act("Hash", g=g); act("Release", g=g)
+        elif s == EPOCH and op == "swap":
+            act("Complete", g=group_of(a))
+    return "<<" + ", ".join(out) + ">>"
+
+
+def check_short_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against PipeShort.tla (three
+    messages, one Room; four groups of up to four members, as the code's
+    g_cap for three messages, and none fills)."""
+    ts = {short_trace(line) for line in lines}
+    return check_traces(tla_jar, models, "PipeShortTrace",
+                        {"Msgs = 3\n          Rooms = 1\n          Credits = 3\n          Groups = 4\n          Members = 4": (ts, len(lines))})
+
+
 def record_pipeline(tree, build):
     """tests/shuttle_pipeline.rs's traced scenarios' schedules: {name: lines},
     each atomic named (site_names)."""
@@ -847,6 +911,14 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
                        "                r.store(0, Ordering::Relaxed);\n            }\n        }\n        let release_holds = (room_count - survivors) + 1;",
                        "                r.store(0, Ordering::Relaxed);\n                PipeStorage::release_n(storage, 1);\n            }\n        }\n        let release_holds = 1;",
                        lambda tree, build: record_pipeline(tree, build)["storage"], check_storage_traces)),
+        ("PipeShort.tla's groups are published only full or by a wait (narrower than the code: push_member's byte limit)",
+         *model_control(tla_jar, "PipeShort.tla", "LET full == Len(ms) + 1 = Members \\/ early IN", "LET full == Len(ms) + 1 = Members IN",
+                        check_short_traces, pipeline["short"])),
+        ("pipeline.rs's run_group completes its epoch before it gives its members' credits back (the model does not)",
+         *code_control(tla_jar, "threads/src/pipeline.rs",
+                       "        // Coalesce consecutive members sharing a Room into a single atomic subtraction.\n",
+                       "        group.completed_epoch.swap(epoch, Ordering::SeqCst);\n        // Coalesce consecutive members sharing a Room into a single atomic subtraction.\n",
+                       lambda tree, build: record_pipeline(tree, build)["short"], check_short_traces)),
         ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
          *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
                        "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
@@ -887,7 +959,8 @@ def main(argv):
     for spec, check, lines in [("FinishTrace", check_finish_traces, finish_lines), ("WakerTrace", check_waker_traces, waker_lines),
                                ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline["room_wait"]),
                                ("PipeTasksTrace", check_tasks_traces, pipeline["lent_parts"]),
-                               ("PipeStorageTrace", check_storage_traces, pipeline["storage"])]:
+                               ("PipeStorageTrace", check_storage_traces, pipeline["storage"]),
+                               ("PipeShortTrace", check_short_traces, pipeline["short"])]:
         passed, said = check(tla_jar, HERE, lines)
         print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
         if not passed:
