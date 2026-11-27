@@ -876,7 +876,20 @@ finds its loan complete), and `PipeStorage.tla` a storage outliving
 its Pipeline (on the free list only once no Pipeline or Room holds it,
 and once; the next Pipeline never hands out a surviving Room's room),
 each with liveness: the owner makes every commit and takes every
-event, and the storage goes back on the free list. `Turn.tla` states
+event, and the storage goes back on the free list. `PipeSlots.tla`
+states the message slots, from `message()` to the event: each slot's
+kind moves only as the code moves it (`SlotKind`, `Free` to `OpenEmpty`
+to the open and waiting kinds and back), events come out in end order
+and each once, an aborted message's event is `Aborted`, and no
+message's event comes before its group, tasks and room pieces are done
+and its Rooms' credits given back. Every wait the code does not refuse
+ends (`message()`, `ready()`, and the open group the end queue's front
+is in, published by a wait), over two slots and three messages, and
+one slot and four, where `message()`'s refusal for untaken events is
+met. Six faults fail it: events taken out of end order, an aborted
+slot freed before its group finishes, a slot freed when its message is
+ended rather than at its event, either wait without its refusal, and a
+wait that does not publish the front's group. `Turn.tla` states
 how workers choose among the registered sources (`lanes.rs`,
 `run_one`): lowest slot first, and every `TURN` items one in turn from
 a cursor that moves past the slot served. Beside a Pipeline that streams
