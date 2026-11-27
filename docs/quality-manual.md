@@ -660,7 +660,7 @@ To run the full test and check suite (which also compiles the official
 git clone -b main https://github.com/servil-software-factory/BLAKE3 && cd BLAKE3
 cargo nextest run --release --lib --tests         # the one-thread crate
 cargo nextest run --release --manifest-path threads/Cargo.toml --lib --tests
-cargo nextest run --release --manifest-path b3sum/Cargo.toml --lib --tests
+cargo nextest run --release --manifest-path b3sum/Cargo.toml
 cargo test --release --doc                        # each doc example in its own process
 cargo nextest run --release --manifest-path test_vectors/Cargo.toml
 cargo nextest run --release --manifest-path capi/Cargo.toml   # the C API
