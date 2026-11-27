@@ -4,10 +4,10 @@
 //!
 //!     RUSTFLAGS="--cfg shuttle" cargo test --release --test shuttle_waker
 //!
-//! The first test's schedules are logged (`log`) and, with `WAKER_TRACE`
-//! set, written to that file, a line a schedule: tools/verify/tla/check.py
-//! checks each is a behavior of Waker.tla (trace validation,
-//! WakerTrace.tla).
+//! Both tests' schedules are logged (`log`) and, with `WAKER_TRACE` set,
+//! written to that file, a line a schedule, tagged with its test's caller
+//! script: tools/verify/tla/check.py checks each is a behavior of
+//! Waker.tla (trace validation, WakerTrace.tla).
 #![cfg(shuttle)]
 
 /// This execution's operations, for trace validation: the slot's state
@@ -25,14 +25,15 @@ mod log {
         LOG.with(|l| l.borrow_mut().push(format!("{id}|{what}|{op}|{value}")));
     }
 
-    /// The finished execution's log, a line, appended to $WAKER_TRACE's
-    /// file in one write; the log cleared.
-    pub fn write() {
+    /// The finished execution's log, a line after its test's `script`
+    /// (WakerScripts.tla's name), appended to $WAKER_TRACE's file in one
+    /// write; the log cleared.
+    pub fn write(script: &str) {
         let lines = LOG.with(|l| core::mem::take(&mut *l.borrow_mut()));
         if let Some(path) = std::env::var_os("WAKER_TRACE") {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
-            f.write_all(format!("{}\n", lines.join(";")).as_bytes()).unwrap();
+            f.write_all(format!("{script}:{}\n", lines.join(";")).as_bytes()).unwrap();
         }
     }
 
@@ -198,7 +199,7 @@ fn waker_slot_never_loses_a_wake_or_races_under_concurrent_finishers() {
             assert_eq!(payload.load(Ordering::Relaxed), 42);
             worker.join().unwrap();
             other.join().unwrap();
-            log::write();
+            log::write("OneWait");
         },
         3000,
         3,
@@ -209,6 +210,7 @@ fn waker_slot_never_loses_a_wake_or_races_under_concurrent_finishers() {
 fn overwrite_and_clear_drop_wakers_and_prevent_spurious_wakes() {
     shuttle::check_pct(
         || {
+            log::clear();
             let slot = Arc::new(WakerSlot::new());
             let s_worker = Arc::clone(&slot);
             let worker = thread::spawn(move || {
@@ -228,6 +230,7 @@ fn overwrite_and_clear_drop_wakers_and_prevent_spurious_wakes() {
             drop((w1, w2));
             assert_eq!(Arc::strong_count(&w1_state), 1, "first waker dropped");
             assert_eq!(Arc::strong_count(&w2_state), 1, "cleared waker dropped");
+            log::write("Swap");
         },
         2000,
         3,

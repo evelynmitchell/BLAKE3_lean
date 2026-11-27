@@ -20,7 +20,7 @@ names of the actions follow the functions they model, for a reader to
 compare.
 
 Then the models are checked against the code (trace validation): the
-Shuttle tests of finish.rs, waker.rs (its first test) and park.rs
+Shuttle tests of finish.rs, waker.rs (both) and park.rs
 (owed_wakes_cascade) log every schedule, operation by operation, and each
 log, turned into its model's actions, must be a behavior of the model
 (FinishTrace.tla, WakerTrace.tla, ParkTrace.tla).
@@ -53,7 +53,7 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "PipeShort", "Turn"]
+MODELS = ["Finish", "MCWaker", "MCWakerSwap", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "PipeShort", "Turn"]
 
 # (model, what the fault is, file, text to find once, its replacement, ...more
 # pairs of text and replacement for a fault that moves a step). The
@@ -66,9 +66,9 @@ CONTROLS = [
      "             /\\ sleeping' = TRUE /\\ have' = have\n             /\\ wpc' = IF have < Target THEN \"park\" ELSE \"clear\""),
     ("Finish", "the caller returns on any wake, without re-reading the count", "Finish.tla",
      "SpuriousWake == /\\ wpc = \"park\" /\\ wpc' = \"recheck\"", "SpuriousWake == /\\ wpc = \"park\" /\\ wpc' = \"clear\""),
-    ("Waker", "the caller does not re-check after registering", "Waker.tla",
+    ("MCWaker", "the caller does not re-check after registering", "Waker.tla",
      "             /\\ cpc' = IF done > seen THEN \"clear0\" ELSE \"pending\"", "             /\\ cpc' = \"pending\""),
-    ("Waker", "the worker takes the Waker while the caller writes it", "Waker.tla",
+    ("MCWaker", "the worker takes the Waker while the caller writes it", "Waker.tla",
      "              /\\ IF state = \"registered\"\n                 THEN state' = \"waking\"",
      "              /\\ IF state \\in {\"registered\", \"writing\"}\n                 THEN state' = \"waking\""),
     ("MCPark", "the worker parks without looking again after setting its bit", "Park.tla",
@@ -194,28 +194,56 @@ def record_waker(tree, build):
     return record(tree, build, "shuttle_waker", "WAKER_TRACE")
 
 
+# WakerScripts.tla's scripts, by the name tests/shuttle_waker.rs tags a line with.
+SCRIPTS = {"OneWait": ["wait"], "Swap": ["register", "register", "clear"]}
+
+
 def waker_trace(line):
-    """One schedule of tests/shuttle_waker.rs's first test as Waker.tla's
-    actions: the caller (the main thread) through Check, register's fast
-    path or loop, Recheck, the wait, clear; the worker (the thread that
-    sets `done`) and the other notifier through notify_after_seqcst and
-    wake_slow. A wake_slow that took no Waker wakes nothing: its Wake3
-    follows its store at once."""
+    """One schedule of a tests/shuttle_waker.rs test, tagged with its
+    caller's script (WakerScripts.tla), as Waker.tla's actions: (the
+    script's name, the trace). The caller (the main thread) runs its
+    script's steps: a wait's Check reads `done`, a register's and a clear's
+    is the step's start; then register's fast path or loop, Recheck, the
+    wait, clear. The worker (the thread that sets `done`) and the others
+    notify (notify_after_seqcst, wake_slow). A wake_slow that took no Waker
+    wakes nothing: its Wake3 follows its store at once."""
+    name, line = line.split(":", 1)
+    script = SCRIPTS[name]
     events = [e.split("|") for e in line.split(";")]
     workers = {t for (t, what, op, _) in events if what == "done" and op == "swap"}
     others = sorted({t for (t, _, _, _) in events if t != CALLER and t not in workers})
     number = {t: 0 for t in workers} | {t: k + 1 for k, t in enumerate(others)}
-    out, phase, nphase = [], "top", {}
+    out, phase, step = [], "top", 0
     act = lambda a: out.append(f'[a |-> "{a}"]')
+
+    def stepped():
+        nonlocal step, phase
+        step += 1
+        phase = "top" if step < len(script) else "end"
+
+    def registered():   # a wait re-checks its item; a register is done
+        nonlocal phase
+        if script[step] == "wait":
+            phase = "recheck"
+        else:
+            stepped()
+
+    def cleared():   # a wait takes its item; a clear is done
+        if script[step] == "wait":
+            act("Got")
+        stepped()
+
     for k, (thread, what, op, value) in enumerate(events):
         if thread == CALLER:
             if phase == "end":
                 continue
             word = op.split()
+            if phase == "top" and script[step] != "wait":
+                act("Check"); phase = "fast" if script[step] == "register" else "clear"
             if phase == "top" and what == "done":
                 act("Check")
                 if value == "true":
-                    act("Got"); phase = "end"
+                    act("Got"); stepped()
                 else:
                     phase = "fast"
             elif phase == "fast" and word[0] == "cas":
@@ -223,7 +251,12 @@ def waker_trace(line):
             elif phase == "compare" and what == "cell":
                 act("Compare"); phase = "fastback"
             elif phase == "fastback" and word[0] == "store":
-                act("FastBack"); phase = "recheck"
+                # will_wake: a wait's Waker is the one before; a register's is new.
+                act("FastBack")
+                if script[step] == "wait":
+                    registered()
+                else:
+                    phase = "load"
             elif phase == "load" and word[0] == "load":
                 act("Load"); phase = "cas" if word[1] in ("0", "2") else "load"
             elif phase == "cas" and word[0] == "cas":
@@ -231,7 +264,7 @@ def waker_trace(line):
             elif phase == "put" and what == "cell":
                 act("Put"); phase = "putback"
             elif phase == "putback" and word[0] == "store":
-                act("PutBack"); phase = "recheck"
+                act("PutBack"); registered()
             elif phase == "recheck" and what == "done":
                 act("Recheck"); phase = "clear" if value == "true" else "pending"
             elif phase == "pending" and what == "woken":
@@ -239,7 +272,7 @@ def waker_trace(line):
                     act("Wake"); phase = "top"
             elif phase == "clear" and word[0] == "load":
                 if word[1] == "0":
-                    act("Clear0"); act("Got"); phase = "end"
+                    act("Clear0"); cleared()
                 elif word[1] == "2":
                     phase = "clearcas"
                 else:
@@ -252,7 +285,7 @@ def waker_trace(line):
             elif phase == "clear1" and what == "cell":
                 act("Clear1"); phase = "clear2"
             elif phase == "clear2" and word[0] == "store":
-                act("Clear2"); act("Got"); phase = "end"
+                act("Clear2"); cleared()
             else:
                 sys.exit(f"check.py: the caller's {what} {op} {value} in phase {phase} is no Waker.tla action")
         else:
@@ -276,7 +309,7 @@ def waker_trace(line):
                 nact("Wake3")
             else:
                 sys.exit(f"check.py: a notifier's {what} {op} is no Waker.tla action")
-    return "<<" + ", ".join(out) + ">>"
+    return name, "<<" + ", ".join(out) + ">>"
 
 
 def record_park(tree, build):
@@ -389,10 +422,14 @@ def check_park_traces(tla_jar, models, lines):
 
 
 def check_waker_traces(tla_jar, models, lines):
-    """Every distinct schedule in `lines` against Waker.tla (one item, one
-    other notifier)."""
-    ts = {waker_trace(line) for line in lines}
-    return check_traces(tla_jar, models, "WakerTrace", {"Rounds = 1\n          Others = 1": (ts, len(lines))})
+    """Every distinct schedule in `lines` against Waker.tla, with its test's
+    script and one other notifier."""
+    groups = {}
+    for line in lines:
+        name, trace = waker_trace(line)
+        ts, n = groups.get(f"Script <- {name}\n          Others = 1", (set(), 0))
+        groups[f"Script <- {name}\n          Others = 1"] = (ts | {trace}, n + 1)
+    return check_traces(tla_jar, models, "WakerTrace", groups, extends="WakerScripts")
 
 
 def finish_trace(pieces, line):
@@ -520,6 +557,9 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines):
         ("Waker.tla's notifiers notify only once the item is done (narrower than the code)",
          *model_control(tla_jar, "Waker.tla", 'Notify(n) ==  /\\ npc[n] = "notify"', 'Notify(n) ==  /\\ npc[n] = "notify" /\\ done > 0',
                         check_waker_traces, waker_lines)),
+        ("Waker.tla's register has no fast path (narrower than the code: the second test takes it)",
+         *model_control(tla_jar, "Waker.tla", 'Fast ==       /\\ cpc = "fast"\n              /\\ IF state = "registered"',
+                        'Fast ==       /\\ cpc = "fast"\n              /\\ IF FALSE', check_waker_traces, waker_lines)),
         ("waker.rs's notify_after_seqcst() tries wake_slow whenever the slot is not IDLE (the model does not)",
          *code_control(tla_jar, "threads/src/waker.rs", "if self.state.0.load(Ordering::SeqCst) == REGISTERED {",
                        "if self.state.0.load(Ordering::SeqCst) != IDLE {", record_waker, check_waker_traces)),

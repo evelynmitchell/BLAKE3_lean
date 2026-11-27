@@ -942,14 +942,16 @@ publisher's add and equal payments by others, past these instances;
 Shuttle's `coincident_publishers_and_payers_keep_fresh_fanout` covers
 it. The models are not the code; Shuttle runs the code. The two are
 tied by trace validation: `tests/shuttle_finish.rs`, `shuttle_waker.rs`
-(its first test) and `shuttle_park.rs` (`owed_wakes_cascade`) log each
+(both tests) and `shuttle_park.rs` (`owed_wakes_cascade`) log each
 operation `finish.rs`, `waker.rs` and `park.rs` make (their primitives
 log from inside Shuttle's own atomic step, so the log's order is the
 operations'), and `check.py` checks every schedule Shuttle runs is a
 behavior of its model (`FinishTrace.tla`, `WakerTrace.tla`,
 `ParkTrace.tla`: a trace a deadlock where the model cannot take it):
-9,000 schedules of the finish line (15 distinct), 3,000 of the waker
-slot (about 60) and 3,000 of the park (about 650). For each, a model
+9,000 schedules of the finish line (15 distinct), 5,000 of the waker
+slot (about 60 of a caller waiting for an item and 7 of one registering
+two Wakers and clearing: `Waker.tla`'s caller runs a script of such
+steps, `WakerScripts.tla`) and 3,000 of the park (about 650). For each, a model
 narrowed past the code and code the model does not follow (in a copy of
 the tree) are rejected.
 
@@ -963,10 +965,12 @@ done. `Park.tla` read the parked count and owed the rest in one step,
 where `wake_for` does the two apart, and merged the park loop's load of
 the bit with its park, so a token left between them went unused where
 the code's park takes it. Each now follows the code, and the models'
-properties and controls hold. One gap the check found in Shuttle's
-tests: `shuttle_waker.rs`'s first test never takes `install_waker`'s
-fast path (every register after the first follows a wake that left the
-slot IDLE), and its second test, which does, is not validated.
+properties and controls hold. `shuttle_waker.rs`'s first test never
+takes `install_waker`'s fast path (every register after the first
+follows a wake that left the slot IDLE), so a model without the fast
+path passed its traces; its second test takes it, and with its traces
+that model is rejected. The `Pipeline`'s models are not yet checked
+against the code's schedules (#31).
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
