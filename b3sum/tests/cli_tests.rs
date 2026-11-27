@@ -1877,3 +1877,47 @@ fn test_terminal_stdout_flushes_multi_file_large_before_blocked_fifo() {
     let status = guard.0.take().unwrap().wait().unwrap();
     assert!(status.success(), "b3sum exited {status:?}");
 }
+
+/// b3sum against both vector files (official BLAKE3's and the Lean
+/// definition's): each case's input in a file of its own, every file in
+/// one run per mode, their 131-byte outputs (every case has at least that
+/// many) in the order named.
+#[test]
+fn test_vector_files() {
+    #[path = "../../test_vectors/src/parse.rs"]
+    mod vectors;
+    let dir = tempfile::tempdir().unwrap();
+    for (file, json) in vectors::FILES {
+        let data = vectors::parse_json(json);
+        let max = data.cases.iter().map(|c| c.input_len).max().unwrap_or(0);
+        let input: Vec<u8> = (0..max).map(|i| (i % 251) as u8).collect();
+        let paths: Vec<PathBuf> = data
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let path = dir.path().join(format!("{file}.{i}"));
+                fs::write(&path, &input[..c.input_len]).unwrap();
+                path
+            })
+            .collect();
+        let modes: [(&[&str], Option<&[u8]>, fn(&vectors::Case) -> &str); 3] = [
+            (&[], None, |c| &c.hash),
+            (&["--keyed"], Some(data.key.as_bytes()), |c| &c.keyed_hash),
+            (&["--derive-key", &data.context_string], None, |c| &c.derive_key),
+        ];
+        for (flags, stdin, expected) in modes {
+            let mut run = cmd(b3sum_exe(), flags.iter().copied().chain(["--no-names", "--length", "131"]));
+            run.args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
+            if let Some(key) = stdin {
+                run = run.stdin_bytes(key);
+            }
+            let output = run.read().unwrap();
+            let lines: Vec<&str> = output.lines().collect();
+            assert_eq!(lines.len(), data.cases.len(), "{file} {flags:?}: one line a file");
+            for (case, line) in data.cases.iter().zip(lines) {
+                assert_eq!(line, &expected(case)[..262], "{file} {flags:?}, {} bytes", case.input_len);
+            }
+        }
+    }
+}

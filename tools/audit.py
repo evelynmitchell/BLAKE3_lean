@@ -36,6 +36,10 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 NEXTEST = "cmd:cargo-nextest"
+# The Lean definition's vectors, rewritten and compared with the committed copy
+# the Rust tests read (test_vectors/lean_vectors.json).
+LEAN_VECTORS = ("(cd tools/verify/lean && lake build vectors && .lake/build/bin/vectors ../../../test_vectors/lean_vectors.json)"
+                " && git diff --exit-code test_vectors/lean_vectors.json")
 SHUTTLE = "--test shuttle_finish --test shuttle_park --test shuttle_waker --test shuttle_pipeline"
 
 
@@ -58,6 +62,7 @@ CHECKS = [
     check("lean_emit", "Lean specification",
           "python3 tools/verify/lean/emit.py && git diff --exit-code tools/verify/lean/compress.json tools/verify/lean/Generic.lean",
           ["cmd:lake"]),
+    check("lean_vectors", "Lean specification", LEAN_VECTORS, ["cmd:lake"]),
     check("proof_helpers", "Machine-code proofs (Z3)", "python3 -m unittest discover -s tools/verify -p 'test_*.py'",
           ["py:z3"]),
     check("unsafe_reasons", "unsafe Rust", "python3 tools/unsafe_reasons.py"),

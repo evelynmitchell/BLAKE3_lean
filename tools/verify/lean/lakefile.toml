@@ -16,3 +16,9 @@ name = "Term"
 
 [[lean_lib]]
 name = "Sound"
+
+# test_vectors/lean_vectors.json (Vectors.lean): compiled, since the interpreter takes
+# minutes over the inputs.
+[[lean_exe]]
+name = "vectors"
+root = "Vectors"

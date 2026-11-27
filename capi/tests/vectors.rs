@@ -1,6 +1,7 @@
-//! The C API against the official test vectors (test_vectors.json), through
-//! every call: one-shot, and a hasher fed in uneven pieces, its digest and
-//! its extended output at an offset.
+//! The C API against both vector files (official BLAKE3's and the Lean
+//! definition's, `vectors::FILES`), through every call: one-shot, and a
+//! hasher fed in uneven pieces, its digest and its extended output at an
+//! offset.
 
 use b3_servil::*;
 use core::ffi::c_void;
@@ -10,7 +11,12 @@ mod vectors;
 
 #[test]
 fn every_call_against_the_test_vectors() {
-    let data = vectors::parse_json(include_str!("../../test_vectors/test_vectors.json"));
+    for (file, json) in vectors::FILES {
+        every_call_against(file, &vectors::parse_json(json));
+    }
+}
+
+fn every_call_against(file: &str, data: &vectors::Cases) {
     let key: [u8; 32] = data.key.as_bytes().try_into().unwrap();
     let context = std::ffi::CString::new(data.context_string.as_str()).unwrap();
     let modes = unsafe { [("hash", b3_mode_plain()), ("keyed_hash", b3_mode_keyed(key.as_ptr())), ("derive_key", b3_mode_derive_key(context.as_ptr()))] };
@@ -25,7 +31,7 @@ fn every_call_against_the_test_vectors() {
                 "derive_key" => case.derive_key.as_str(),
                 _ => unreachable!(),
             };
-            let what = format!("{name}, {len} bytes");
+            let what = format!("{file}: {name}, {len} bytes");
             unsafe {
                 assert_eq!(vectors::hex_encode(&b3_hash(mode, input.as_ptr() as *const c_void, len).bytes), expected[..64], "b3_hash, {what}");
                 // A hasher fed in pieces of 1, 1000, and the rest.
