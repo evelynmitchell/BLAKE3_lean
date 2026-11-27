@@ -9,8 +9,9 @@ waker.rs and park.rs one atomic operation an action, and PipeRooms.tla,
 PipeTasks.tla and PipeStorage.tla the Pipeline's (pipeline.rs) rooms and
 their credits, messages hashed in parts, loans and groups, a storage
 outliving its Pipeline, PipeSlots.tla its message slots and the order of
-their events, and PipeQueue.tla its source's action queue and its rings,
-and Turn.tla the workers' choice among sources
+their events, PipeQueue.tla its source's action queue and its rings, and
+PipeShort.tla short messages sharing Rooms and groups, and batches, and
+Turn.tla the workers' choice among sources
 (lanes.rs, run_one), and TLC checks every
 schedule of a small instance: the safety properties as invariants, and that
 no wake is lost as a liveness property under weak fairness, which Shuttle's
@@ -52,7 +53,7 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "Turn"]
+MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "PipeShort", "Turn"]
 
 # (model, what the fault is, file, text to find once, its replacement, ...more
 # pairs of text and replacement for a fault that moves a step). The
@@ -122,6 +123,14 @@ CONTROLS = [
     ("PipeQueue", "free_slots is one short of the slots", "PipeQueue.tla", "SlotRing == Slots", "SlotRing == Slots - 1"),
     ("PipeQueue", "local_free_rooms is one short of the rooms", "PipeQueue.tla",
      "RoomRing == IF Rooms > 1 THEN Rooms ELSE 1", "RoomRing == Rooms - 1"),
+    ("PipeShort", "a group is reused before its epoch completes", "PipeShort.tla",
+     "         /\\ IF ~InFlight(g)\n            THEN JoinAt", "         /\\ IF TRUE\n            THEN JoinAt"),
+    ("PipeShort", "Pipeline::drop gives back the credits of published groups' members too (released twice)", "PipeShort.tla",
+     "(Short(m) /\\ openG # 0 /\\ m \\in InGroup(openG))", "(Short(m) /\\ msg[m].g # 0)"),
+    ("PipeShort", "a group is filled without its members' rooms in its metas (credits never back)", "PipeShort.tla",
+     "metas |-> Append(rs, msg[m].r)", "metas |-> Append(rs, 0)"),
+    ("PipeShort", "a member's event (a batch's digests) is read before its group completes", "PipeShort.tla",
+     "Ready(m) == IF msg[m].g = 0 THEN TRUE ELSE completed[msg[m].g] >= msg[m].e", "Ready(m) == TRUE"),
     ("Turn", "every walk starts at slot 0 (no turns: a streaming Pipeline starves the rest)", "Turn.tla",
      "      start == IF inTurn THEN cursor[w] ELSE 1", "      start == 1"),
     ("Turn", "a turn's cursor stays on the slot it served", "Turn.tla",

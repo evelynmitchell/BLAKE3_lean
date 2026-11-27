@@ -907,7 +907,24 @@ taken twice), a wait without `wake_for_waiting`, and each of the four
 rings one short (the action ring's met in a smaller instance whose
 owner can fill it). The code's own use is tighter (a slot is used one
 way, and a short Room's piece shares its Room), so its queue holds
-fewer than the ring. `Turn.tla` states
+fewer than the ring. `PipeShort.tla` states short messages sharing a
+Room and groups, and small batches: a short commit's credit on its
+Room, the members of groups (`push_member`, `flush_sealed_short_rooms`,
+`publish_open`), a group's task giving back its members' credits room
+by room (`run_group`), groups reused by epoch (`acquire_free_group`,
+`group_ready`), and `Pipeline::drop` giving back the credits of
+`OpenShort` slots and of the open group's members. Each short
+message's credit comes back once, and each room's count is exactly the
+held Room's unspent credits and its messages' credits still out; a
+group's members are read from their rooms' hand-outs; a group is
+filled again only once its last epoch has completed; an event (a
+batch's digests) is read only once its group wrote it; once the
+Pipeline and its Room are dropped every credit is back; and every
+ended message's event is taken unless the Pipeline is dropped first.
+Four faults fail it: a group reused before its epoch completes, a drop
+that also gives back published groups' members' credits, a group
+whose metas leave out its members' rooms, and an event read before its
+group completes. `Turn.tla` states
 how workers choose among the registered sources (`lanes.rs`,
 `run_one`): lowest slot first, and every `TURN` items one in turn from
 a cursor that moves past the slot served. Beside a Pipeline that streams
