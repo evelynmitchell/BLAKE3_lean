@@ -57,7 +57,7 @@ and a C compiler (for the official `blake3` test oracle and `capi/` tests):
 ```sh
 cargo nextest run --release --lib --tests
 cargo nextest run --release --manifest-path threads/Cargo.toml --lib --tests
-cargo nextest run --release --manifest-path b3sum/Cargo.toml --lib --tests
+cargo nextest run --release --manifest-path b3sum/Cargo.toml
 ```
 
 The [quality manual](docs/quality-manual.md) gives commands for the assembly
