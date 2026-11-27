@@ -5,7 +5,10 @@
     python3 tools/verify/tla/check.py --models     # the models alone
 
 The models (Finish.tla, Waker.tla, Park.tla) state threads/src/finish.rs,
-waker.rs and park.rs one atomic operation an action, and TLC checks every
+waker.rs and park.rs one atomic operation an action, and PipeRooms.tla,
+PipeTasks.tla and PipeStorage.tla the Pipeline's (pipeline.rs) rooms and
+their credits, messages hashed in parts, loans and groups, and a storage
+outliving its Pipeline, and TLC checks every
 schedule of a small instance: the safety properties as invariants, and that
 no wake is lost as a liveness property under weak fairness, which Shuttle's
 sampled schedules cannot state. They model the code; they are not it. The
@@ -40,9 +43,11 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave"]
+MODELS = ["Finish", "Waker", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage"]
 
-# (model, what the fault is, file, text to find once, its replacement)
+# (model, what the fault is, file, text to find once, its replacement, ...more
+# pairs of text and replacement for a fault that moves a step). The
+# Pipeline's ten are tools/pipeline_model_controls.py's, in the models.
 CONTROLS = [
     ("Finish", "the finisher compares the count before its own piece (never unparks)", "Finish.tla",
      "IF sleeping /\\ count + 1 = Target THEN", "IF sleeping /\\ count = Target THEN"),
@@ -61,6 +66,29 @@ CONTROLS = [
      "              /\\ wpc' = [wpc EXCEPT ![w] = \"park\"]"),
     ("MCParkLeave", "a worker leaving with work drops a wake meant for it (not passed on)", "Park.tla",
      "IF parked[w] THEN \"look\" ELSE \"passon\"", "\"look\""),
+    ("PipeTasks", "Pipeline 1: a group is published done before its members are hashed", "PipeTasks.tla",
+     "/\\ gpc = \"run\" /\\ groupDone = FALSE", "/\\ gpc = \"complete\" /\\ groupDone = FALSE",
+     "/\\ groupDone' = TRUE /\\ gpc' = \"end\"", "/\\ groupDone' = TRUE /\\ gpc' = \"run\"",
+     "/\\ members' = [m \\in 1..Members |-> TRUE] /\\ gpc' = \"complete\"", "/\\ members' = [m \\in 1..Members |-> TRUE] /\\ gpc' = \"end\""),
+    ("PipeRooms", "Pipeline 2: a finished task wakes no one", "PipeRooms.tla",
+     "![p].done = TRUE]\n              /\\ Notify", "![p].done = TRUE]\n              /\\ UNCHANGED <<registered, woken>>"),
+    ("PipeRooms", "Pipeline 3: a room piece is published done before it is hashed", "PipeRooms.tla",
+     "/\\ piece' = [piece EXCEPT ![p].pc = \"reading\"]", "/\\ piece' = [piece EXCEPT ![p].pc = \"reading\", ![p].done = TRUE]"),
+    ("PipeRooms", "Pipeline 4: a room piece gives its room back before it has read it", "PipeRooms.tla",
+     "/\\ piece' = [piece EXCEPT ![p].pc = \"reading\"]\n              /\\ UNCHANGED <<refs, gen,",
+     "/\\ piece' = [piece EXCEPT ![p].pc = \"reading\"]\n              /\\ refs' = [refs EXCEPT ![piece[p].room] = refs[piece[p].room] - 1]\n              /\\ UNCHANGED <<gen,"),
+    ("PipeTasks", "Pipeline 5 and 10: a message's (a batch's) parts are published done before the last is hashed", "PipeTasks.tla",
+     "IF left = 1 THEN \"fold\" ELSE \"end\"", "IF left # 0 THEN \"fold\" ELSE \"end\""),
+    ("PipeStorage", "Pipeline 6: a storage goes back on the free list while a Room still holds it", "PipeStorage.tla",
+     "IF holders = n THEN", "IF holders >= n THEN"),
+    ("PipeRooms", "Pipeline 7: a Room's drop gives back one credit more than it has", "PipeRooms.tla",
+     "LET unused == Credits - commits[r]", "LET unused == Credits - commits[r] + (IF commits[r] # 0 THEN 1 ELSE 0)"),
+    ("PipeRooms", "Pipeline 8: a Room's drop wakes no one", "PipeRooms.tla",
+     "IF prev = unused THEN Notify ELSE UNCHANGED <<registered, woken>>", "UNCHANGED <<registered, woken>>"),
+    ("PipeTasks", "Pipeline 9: a loan's event comes before the loan is marked complete", "PipeTasks.tla",
+     "/\\ ppc' = [ppc EXCEPT ![p] = \"loan\"]", "/\\ ppc' = [ppc EXCEPT ![p] = \"publish\"]",
+     "/\\ loanDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"publish\"]", "/\\ loanDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"end\"]",
+     "/\\ slotDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"end\"]", "/\\ slotDone' = TRUE /\\ ppc' = [ppc EXCEPT ![p] = \"loan\"]"),
 ]
 
 
@@ -100,16 +128,18 @@ def main(argv):
             failed.append(model)
             print(out[-3000:])
     if "--models" not in argv:
-        for model, what, name, old, new in CONTROLS:
+        for model, what, name, *edits in CONTROLS:
             with tempfile.TemporaryDirectory() as d:
                 for f in os.listdir(HERE):
                     if f.endswith((".tla", ".cfg")):
                         shutil.copy(os.path.join(HERE, f), d)
                 path = os.path.join(d, name)
                 text = open(path).read()
-                if text.count(old) != 1:
-                    sys.exit(f"check.py: the control's text is not in {name} once: {what}")
-                open(path, "w").write(text.replace(old, new))
+                for old, new in zip(edits[::2], edits[1::2]):
+                    if text.count(old) != 1:
+                        sys.exit(f"check.py: the control's text is not in {name} once: {what}: {old!r}")
+                    text = text.replace(old, new)
+                open(path, "w").write(text)
                 passed, out = tlc(tla_jar, d, model)
             found = next((line for line in out.splitlines() if "violated" in line or "Deadlock" in line), "")
             print(f"control {model}: {what}: {'NOT CAUGHT' if passed else 'caught'} {found.strip()}", flush=True)
