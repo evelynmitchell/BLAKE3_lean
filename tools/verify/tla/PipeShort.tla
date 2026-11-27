@@ -9,8 +9,8 @@
    share one Room. A message's end (end) or a wait for a Room
    (flush_sealed_short_rooms, for every OpenShort slot) makes it a member
    of the open group (push_member), its room in the group's metas
-   (local_rooms); a group holds `Members` at most and is published full, or
-   by a wait (publish_open). A small batch (batch, under TASK_LEN) is a
+   (local_rooms); a group holds `Members` at most and is published full, past
+   push_member's byte limit (here a choice), or by a wait (publish_open). A small batch (batch, under TASK_LEN) is a
    member too, of a group of batches; its digests are the group's to write
    and the owner's to read at its event. A member of the other kind
    publishes the open group first. An abort gives an OpenShort slot's
@@ -79,24 +79,26 @@ Publish == IF openG = 0 THEN UNCHANGED <<assigned, wst, openG>>
    step of acquire_free_group (publishing an open group of the other kind
    first). *)
 CanJoin(k) == openG # 0 /\ grp[openG].kind = k
-\* Join group g at epoch e, its members so far `ms` and metas `rs`.
-JoinAt(m, next, g, e, k, ms, rs) ==
-    LET full == Len(ms) + 1 = Members IN
+\* Join group g at epoch e, its members so far `ms` and metas `rs`; a group
+\* full, or `early` (push_member's byte limit), is published at once.
+JoinAt(m, next, g, e, k, ms, rs, early) ==
+    LET full == Len(ms) + 1 = Members \/ early IN
     /\ grp' = [grp EXCEPT ![g] = [epoch |-> e, kind |-> k, members |-> Append(ms, m), metas |-> Append(rs, msg[m].r)]]
     /\ msg' = [msg EXCEPT ![m].pc = next, ![m].g = g, ![m].e = e]
     /\ IF full THEN assigned' = [assigned EXCEPT ![g] = e] /\ wst' = [wst EXCEPT ![g] = "queued"] /\ openG' = 0
        ELSE openG' = g /\ UNCHANGED <<assigned, wst>>
-Push(m, k, next) ==
+PushE(m, k, next, early) ==
     IF CanJoin(k)
-    THEN JoinAt(m, next, openG, grp[openG].epoch, k, grp[openG].members, grp[openG].metas) /\ UNCHANGED <<completed, nextE, cursor>>
+    THEN JoinAt(m, next, openG, grp[openG].epoch, k, grp[openG].members, grp[openG].metas, early) /\ UNCHANGED <<completed, nextE, cursor>>
     ELSE IF openG # 0
     THEN Publish /\ UNCHANGED <<grp, msg, completed, nextE, cursor>>
     ELSE LET g == cursor IN       \* open_new_group, and the member pushed
          /\ cursor' = (g % Groups) + 1
          /\ IF ~InFlight(g)
-            THEN JoinAt(m, next, g, nextE, k, <<>>, <<>>) /\ nextE' = nextE + 1
+            THEN JoinAt(m, next, g, nextE, k, <<>>, <<>>, early) /\ nextE' = nextE + 1
             ELSE UNCHANGED <<grp, msg, assigned, wst, openG, nextE>>
          /\ UNCHANGED completed
+Push(m, k, next) == \E early \in BOOLEAN : PushE(m, k, next, early)
 
 (* The owner. *)
 \* room(): a free room, given all its credits.
@@ -133,13 +135,14 @@ Batch == /\ Active /\ opened < Msgs
          /\ msg' = [msg EXCEPT ![opened + 1] = [NoMsg EXCEPT !.pc = "batching", !.kind = "batch"]]
          /\ opened' = opened + 1
          /\ UNCHANGED <<rooms, back, groups, out, opc, dropped>>
-OnMsg(m) ==
+OnMsgE(m, early) ==
     /\ Active
-    /\ \/ msg[m].pc = "batching" /\ Push(m, "batch", "wait")
-       \/ msg[m].pc = "openshort" /\ Push(m, "short", "wait")                        \* end
+    /\ \/ msg[m].pc = "batching" /\ PushE(m, "batch", "wait", early)
+       \/ msg[m].pc = "openshort" /\ PushE(m, "short", "wait", early)                \* end
        \/ msg[m].pc = "dispatched" /\ msg' = [msg EXCEPT ![m].pc = "wait"] /\ UNCHANGED <<grp, assigned, completed, wst, openG, nextE, cursor>>
        \/ msg[m].pc = "dispatched" /\ msg' = [msg EXCEPT ![m].pc = "aborted"] /\ UNCHANGED <<grp, assigned, completed, wst, openG, nextE, cursor>>
     /\ UNCHANGED <<rooms, back, out, opened, opc, dropped>>
+OnMsg(m) == \E early \in BOOLEAN : OnMsgE(m, early)
 \* abort of an OpenShort slot: its credit back now.
 AbortShort(m) == /\ Active /\ msg[m].pc = "openshort"
                  /\ refs' = [refs EXCEPT ![msg[m].r] = @ - 1] /\ back' = [back EXCEPT ![m] = @ + 1]

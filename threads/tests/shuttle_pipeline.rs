@@ -370,6 +370,7 @@ mod lanes {
                 REGISTERED.lock().unwrap().retain(|&at| at != slot);
             }
             pub(crate) unsafe fn publish_actions(&self, run: unsafe fn(*const (), u64, Platform), context: *const (), args: &[u64], _near: bool) {
+                crate::trace::note("publish");
                 let mut waiting = self.waiting.lock().unwrap();
                 assert!(waiting.len() + args.len() <= self.actions, "more actions than the Source was made for");
                 waiting.extend(args.iter().map(|&arg| (run, context as usize, arg)));
@@ -707,6 +708,59 @@ fn a_storage_outlives_its_pipeline_in_its_rooms() {
     });
 }
 
+/// Three short messages from one Room: the first ended (past push_member's
+/// byte limit, so its group goes to the workers at once, while the rest
+/// are written), the second aborted while open, the last ended into a
+/// group of its own; the Room dropped, the events taken, the Pipeline
+/// dropped. As tools/verify/tla/PipeShort.tla has
+/// them. The scenario notes its own calls, since slot kinds and groups are
+/// not atomics. Traced (PipeShortTrace.tla).
+fn short_messages_share_a_room_and_a_group() {
+    check(|| {
+        trace::start("short");
+        with_workers(1, || {
+            let (inputs, want) = inputs_of(&[20_000, 40, 70]);
+            let mut pipe = Pipeline::<usize, ()>::new(Mode::Plain, Limits { messages: 3, rooms: 1 });
+            let mut room = block_on(pipe.room());
+            for (tag, bytes) in inputs.iter().enumerate() {
+                let mut message = block_on(pipe.message(tag, None));
+                room.bytes_mut()[..bytes.len()].copy_from_slice(bytes);
+                trace::note(&format!("commit {tag}"));
+                pipe.commit(&mut message, &mut room, bytes.len());
+                if tag == 1 {
+                    trace::note(&format!("abort {tag}"));
+                    pipe.abort(message);
+                } else {
+                    trace::note(&format!("end {tag}"));
+                    pipe.end(message);
+                }
+            }
+            trace::note("droproom");
+            drop(room);
+            let mut left = inputs.len();
+            while left > 0 {
+                match pipe.next_event() {
+                    Some(Event::Hashed { tag, hash, .. }) => {
+                        assert_eq!(hash, want[tag], "message {tag}'s digest");
+                        trace::note(&format!("event {tag}"));
+                        left -= 1;
+                    }
+                    Some(Event::Aborted { tag, .. }) => {
+                        assert_eq!(tag, 1, "the aborted message");
+                        trace::note(&format!("event {tag}"));
+                        left -= 1;
+                    }
+                    Some(_) => panic!("an event of another kind"),
+                    None => block_on(pipe.ready()),
+                }
+            }
+            trace::note("drop");
+            drop(pipe);
+        });
+        trace::write();
+    });
+}
+
 /// A wait for a Room while the Pipeline's one Room is alive on another
 /// thread, with bytes committed from it that a worker may still be
 /// reading: the wait ends when the Room has been dropped there and the
@@ -943,7 +997,7 @@ fn an_aborted_message_leaves_the_others_whole() {
 #[test]
 fn the_pipeline_under_shuttle() {
     blake3_servil_core::initialize();
-    let scenarios: [(&str, fn()); 11] = [
+    let scenarios: [(&str, fn()); 12] = [
         ("messages_through_rooms_complete_with_their_own_digests", messages_through_rooms_complete_with_their_own_digests),
         ("owned_messages_complete_and_wake_the_caller", owned_messages_complete_and_wake_the_caller),
         ("a_pipeline_after_another_reuses_its_storage_soundly", a_pipeline_after_another_reuses_its_storage_soundly),
@@ -953,6 +1007,7 @@ fn the_pipeline_under_shuttle() {
         ("lent_messages_are_complete_when_their_events_come", lent_messages_are_complete_when_their_events_come),
         ("lent_parts_and_a_group", lent_parts_and_a_group),
         ("an_aborted_message_leaves_the_others_whole", an_aborted_message_leaves_the_others_whole),
+        ("short_messages_share_a_room_and_a_group", short_messages_share_a_room_and_a_group),
         ("batches_are_whole_when_their_events_come", batches_are_whole_when_their_events_come),
         ("a_pipeline_with_no_pool_slot_does_its_own_work", a_pipeline_with_no_pool_slot_does_its_own_work),
     ];
