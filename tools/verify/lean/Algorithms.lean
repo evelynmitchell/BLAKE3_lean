@@ -7,7 +7,8 @@ import Theorems
 `leftCount n` of them. The library never evaluates it so: its `Hasher` pushes chunks on a stack of
 subtrees and merges as it goes (`src/hasher.rs`), and the pool and the grouped calls cut the input
 into subtrees, hash each on its own, and merge their values (`threads/src/lanes.rs`,
-`src/each.rs`). This file writes those algorithms down and proves each gives the definition's
+`src/each.rs`); its stack may hold a subtree as a row of its parts' values, merged a layer at a
+time. This file writes those algorithms down and proves each gives the definition's
 result, for every input.
 
 The tree theorems are about the tree's shape, so they hold for any function merging two values
@@ -301,6 +302,137 @@ theorem incremental (xs : List α) (x : α) :
   rw [treeOf_single] at this
   rw [this, flatten_singletons]
 
+/-! ## Rows
+
+The `Hasher`'s stack (`CvStack`, `src/hasher.rs`) may hold a full subtree as a row: the values of
+its `n` equal parts (`n` a power of two), not its one value. Rows merge with rows a layer of parents
+at a time; a row becomes its one value when the output needs it or it meets a single value. These
+theorems show a row is that subtree's value, deferred: condensing one gives the subtree's tree, and
+merging two then condensing gives the parent of their trees. -/
+
+/-- One layer of parents: each two adjacent values merged. -/
+def layer : List α → List α
+  | a :: b :: rest => merge a b :: layer rest
+  | xs => xs
+
+/-- `xs` cut into consecutive groups of `s`. -/
+def groups (s : Nat) (xs : List α) : List (List α) :=
+  if _ : 0 < s ∧ xs ≠ [] then xs.take s :: groups s (xs.drop s) else []
+termination_by xs.length
+decreasing_by
+  have := List.length_pos_iff.2 ‹0 < s ∧ xs ≠ []›.2
+  simp only [List.length_drop]; omega
+
+theorem groups_nil (s : Nat) : groups s ([] : List α) = [] := by
+  rw [groups]; simp
+
+theorem groups_cons (s : Nat) (xs : List α) (hs : 0 < s) (h : xs ≠ []) :
+    groups s xs = xs.take s :: groups s (xs.drop s) := by
+  rw [groups]; simp [hs, h]
+
+theorem groups_append (s : Nat) (hs : 0 < s) : ∀ (A B : List α), s ∣ A.length → groups s (A ++ B) = groups s A ++ groups s B := by
+  suffices ∀ n (A B : List α), A.length = n → s ∣ A.length → groups s (A ++ B) = groups s A ++ groups s B from
+    fun A B => this _ A B rfl
+  intro n
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro A B hn hd
+    by_cases hA : A = []
+    · subst hA; simp [groups_nil]
+    have h0 : 0 < A.length := List.length_pos_iff.2 hA
+    have hle : s ≤ A.length := Nat.le_of_dvd h0 hd
+    rw [groups_cons s (A ++ B) hs (by simp [hA]), groups_cons s A hs hA, List.take_append_of_le_length hle,
+      List.drop_append_of_le_length hle,
+      ih (A.length - s) (by omega) (A.drop s) B (by simp) (by simpa using Nat.dvd_sub hd (Nat.dvd_refl s)),
+      List.cons_append]
+
+/-- A full subtree held as a row: the trees of its consecutive parts of `s` elements. -/
+def row (s : Nat) (xs : List α) : List α := (groups s xs).map (treeOf merge)
+
+/-- A layer of parents over a row is the row of parts twice as long: halving a row's width. -/
+theorem layer_row (b : Nat) : ∀ (xs : List α), 2 ^ (b + 1) ∣ xs.length →
+    layer merge (row merge (2 ^ b) xs) = row merge (2 ^ (b + 1)) xs := by
+  suffices ∀ n (xs : List α), xs.length = n → 2 ^ (b + 1) ∣ xs.length →
+      layer merge (row merge (2 ^ b) xs) = row merge (2 ^ (b + 1)) xs from
+    fun xs => this _ xs rfl
+  intro n
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro xs hn hd
+    have hp := Nat.two_pow_pos b
+    by_cases hx : xs = []
+    · subst hx; simp [row, groups_nil, layer]
+    have h0 : 0 < xs.length := List.length_pos_iff.2 hx
+    have hle : 2 ^ (b + 1) ≤ xs.length := Nat.le_of_dvd h0 hd
+    have h2 : 2 ^ (b + 1) = 2 ^ b + 2 ^ b := by rw [Nat.pow_succ]; omega
+    have hd2 : xs.drop (2 ^ b) ≠ [] := by
+      intro h; have := congrArg List.length h; simp at this; omega
+    rw [row, groups_cons _ xs (by omega) hx, groups_cons _ (xs.drop (2 ^ b)) (by omega) hd2, List.drop_drop,
+      List.map_cons, List.map_cons, layer, ← treeOf_pair merge b _ _ (by simp; omega) (by simp; omega),
+      ← List.take_add, ← h2, ← row,
+      ih (xs.length - 2 ^ (b + 1)) (by omega) _ (by simp)
+        (by simpa using Nat.dvd_sub hd (Nat.dvd_refl _)),
+      row, row, groups_cons _ xs (by omega) hx, List.map_cons]
+
+/-- A layer over rows side by side, each of an even width, is each row's layer side by side: so
+`CvStack::condense` may run several rows' layers through one tile of parents. -/
+theorem layer_append : ∀ (r s : List α), r.length % 2 = 0 → layer merge (r ++ s) = layer merge r ++ layer merge s := by
+  suffices ∀ n (r s : List α), r.length = n → r.length % 2 = 0 → layer merge (r ++ s) = layer merge r ++ layer merge s from
+    fun r s => this _ r s rfl
+  intro n
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro r s hn he
+    match r with
+    | [] => rfl
+    | [_] => simp at he
+    | a :: b :: rest =>
+      simp only [List.cons_append, layer]
+      rw [ih rest.length (by simp at hn; omega) rest s rfl (by simp at he; omega)]
+
+/-- `a` layers of parents. -/
+def condense : Nat → List α → List α
+  | 0, r => r
+  | a + 1, r => condense a (layer merge r)
+
+/-- **A row condenses to its subtree's tree.** A full subtree of `2^(a+b)` elements, held as the row of
+its `2^a` parts of `2^b`: `a` layers of parents give its tree (`CvStack::get`, `condense`,
+`narrow`). -/
+theorem condense_row : ∀ (a b : Nat) (xs : List α), xs.length = 2 ^ (a + b) →
+    condense merge a (row merge (2 ^ b) xs) = [treeOf merge xs] := by
+  intro a
+  induction a with
+  | zero =>
+    intro b xs hx
+    have hp := Nat.two_pow_pos b
+    have hne : xs ≠ [] := by intro h; subst h; simp at hx; omega
+    rw [Nat.zero_add] at hx
+    rw [condense, row, groups_cons _ xs hp hne, List.take_of_length_le (by omega), List.drop_of_length_le (by omega),
+      groups_nil]
+    rfl
+  | succ a ih =>
+    intro b xs hx
+    rw [condense, layer_row merge b xs ⟨2 ^ a, by rw [hx, ← Nat.pow_add]; congr 1; omega⟩,
+      ih (b + 1) xs (by rw [hx]; congr 1; omega)]
+
+/-- **Two rows merge into their parent's row.** Sibling full subtrees `A` and `B`, each held as the
+row of its parts of `2^b`: one layer of parents over the two rows side by side is the parent
+subtree's row, of parts of `2^(b+1)`, as wide as each (`CvStack::merge`). -/
+theorem merge_rows (b : Nat) (A B : List α) (hA : 2 ^ b ∣ A.length)
+    (hd : 2 ^ (b + 1) ∣ (A ++ B).length) :
+    layer merge (row merge (2 ^ b) A ++ row merge (2 ^ b) B) = row merge (2 ^ (b + 1)) (A ++ B) := by
+  rw [row, row, ← List.map_append, ← groups_append _ (Nat.two_pow_pos b) A B hA, ← row, layer_row merge b _ hd]
+
+/-- Merging two rows and condensing gives the parent of the subtrees' trees: rows only defer the
+merges a single-valued stack makes, whatever the width (`4` to `ROW`) each is held at. -/
+theorem merge_rows_value (a b : Nat) (A B : List α) (hA : A.length = 2 ^ (a + b)) (hB : B.length = 2 ^ (a + b)) :
+    condense merge a (layer merge (row merge (2 ^ b) A ++ row merge (2 ^ b) B)) = [merge (treeOf merge A) (treeOf merge B)] := by
+  have hlen : (A ++ B).length = 2 ^ (a + (b + 1)) := by
+    rw [List.length_append, hA, hB, show a + (b + 1) = (a + b) + 1 by omega, Nat.pow_succ]; omega
+  rw [merge_rows merge b A B (hA ▸ Nat.pow_dvd_pow 2 (by omega))
+      (hlen ▸ Nat.pow_dvd_pow 2 (by omega)),
+    condense_row merge a (b + 1) _ hlen, treeOf_pair merge (a + b) A B hA hB]
+
 /-! ## Extended output -/
 
 theorem flatMap_flatten_map {α β γ : Type} (g : β → List γ) (f : α → List β) (L : List α) :
@@ -425,6 +557,10 @@ end Blake3.Algorithms
 #print axioms Blake3.Algorithms.incremental
 #print axioms Blake3.Algorithms.blake3_incremental
 #print axioms Blake3.Algorithms.blake3_cut_and_merge
+#print axioms Blake3.Algorithms.condense_row
+#print axioms Blake3.Algorithms.merge_rows
+#print axioms Blake3.Algorithms.merge_rows_value
+#print axioms Blake3.Algorithms.layer_append
 #print axioms Blake3.Algorithms.output_prefix
 #print axioms Blake3.Algorithms.output_block
 #print axioms Blake3.Algorithms.chunk_counter
