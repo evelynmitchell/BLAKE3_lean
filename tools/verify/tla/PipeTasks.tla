@@ -12,9 +12,11 @@
    group's `Members`, then publishes the group's epoch complete and wakes
    the owner (run_group).
 
-   The owner ends both, waits (the WakerSlot's contract, as PipeRooms.tla),
-   takes the message's event and at once drops its guard, then takes the
-   group's event. *)
+   The owner ends both, waits (the WakerSlot's contract, as PipeRooms.tla:
+   a re-check that finds the event ready then clears the Waker, and a wait
+   may poll again with no wake, as block_on does), takes the message's
+   event and at once drops its guard, then takes the group's events.
+   PipeTasksTrace.tla checks this model against the code's schedules. *)
 EXTENDS Naturals, Sequences
 
 CONSTANTS Parts, Members
@@ -80,8 +82,17 @@ Wait ==       /\ opc \in {"msg", "group"}
               /\ UNCHANGED <<woken, msgEvent, guardDropped, groupEvent>> /\ UNCHANGED MsgVars /\ UNCHANGED GroupVars
 Check ==      /\ opc \in {"msgcheck", "groupcheck"}
               /\ LET c == IF opc = "msgcheck" THEN "msg" ELSE "group"
-                 IN IF Ready(c) THEN registered' = FALSE /\ opc' = c \o "take" ELSE opc' = c \o "wait" /\ UNCHANGED registered
+                 IN opc' = IF Ready(c) THEN c \o "clear" ELSE c \o "wait"
+              /\ UNCHANGED <<registered, woken, msgEvent, guardDropped, groupEvent>> /\ UNCHANGED MsgVars /\ UNCHANGED GroupVars
+\* Found it ready: the Waker cleared (WakerSlot::clear), after.
+Clear ==      /\ opc \in {"msgclear", "groupclear"}
+              /\ registered' = FALSE /\ opc' = IF opc = "msgclear" THEN "msgtake" ELSE "grouptake"
               /\ UNCHANGED <<woken, msgEvent, guardDropped, groupEvent>> /\ UNCHANGED MsgVars /\ UNCHANGED GroupVars
+\* A wait polled again with no wake (block_on polls once more before it
+\* sleeps). Outside the fairness assumption: no liveness rests on it.
+Repoll ==     /\ opc \in {"msgwait", "groupwait"}
+              /\ opc' = IF opc = "msgwait" THEN "msg" ELSE "group"
+              /\ UNCHANGED <<registered, woken, msgEvent, guardDropped, groupEvent>> /\ UNCHANGED MsgVars /\ UNCHANGED GroupVars
 Woken ==      /\ opc \in {"msgwait", "groupwait"} /\ woken
               /\ woken' = FALSE /\ opc' = IF opc = "msgwait" THEN "msg" ELSE "group"
               /\ UNCHANGED <<registered, msgEvent, guardDropped, groupEvent>> /\ UNCHANGED MsgVars /\ UNCHANGED GroupVars
@@ -93,10 +104,10 @@ TakeGroup ==  /\ opc = "grouptake"
               /\ opc' = "finished"
               /\ UNCHANGED <<registered, woken, msgEvent, guardDropped>> /\ UNCHANGED MsgVars /\ UNCHANGED GroupVars
 
-Owner == Wait \/ Check \/ Woken \/ TakeMsg \/ TakeGroup
+Owner == Wait \/ Check \/ Clear \/ Woken \/ TakeMsg \/ TakeGroup
 Part(p) == Write(p) \/ Count(p) \/ Fold(p) \/ Loan(p) \/ PublishSlot(p)
 Group == RunMembers \/ Complete
-Next == Owner \/ Group \/ \E p \in 1..Parts : Part(p)
+Next == Owner \/ Repoll \/ Group \/ \E p \in 1..Parts : Part(p)
 Spec == Init /\ [][Next]_vars /\ WF_vars(Owner) /\ WF_vars(Group) /\ \A p \in 1..Parts : WF_vars(Part(p))
 
 (* An event carries a hash of every part (every member): none is published
