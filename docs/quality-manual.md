@@ -852,8 +852,8 @@ the Pipeline and writing its reason beside it;
 TLA+ models of `finish.rs`, `waker.rs` and `park.rs` (`tools/verify/tla/`,
 one atomic operation an action, named after the functions they model)
 are checked by TLC over every schedule of small instances: three
-finishers; three rounds of the waker slot; three workers with one wake
-a hop and three batches, and two workers that leave at the end as
+finishers; three rounds of the waker slot, with a second notifier;
+three workers with one wake a hop and two batches, and two workers that leave at the end as
 `tests/shuttle_park.rs`'s do. Beside the safety invariants (the caller
 returns only with every piece finished, one thread at a time in the
 waker's cell, a wake reaching a worker still looking is passed on)
@@ -892,16 +892,33 @@ Dropping the owed word's generation bump (ABA) is not caught:
 the schedule needs a payer's two compare-and-swaps to straddle a
 publisher's add and equal payments by others, past these instances;
 Shuttle's `coincident_publishers_and_payers_keep_fresh_fanout` covers
-it. The models are not the code; Shuttle runs the code. For the finish
-line the two are tied: `tests/shuttle_finish.rs` logs each operation
-`finish.rs` makes (its primitives log from inside Shuttle's own atomic
-step, so the log's order is the operations'), and `check.py` checks every
-schedule Shuttle runs (9,000; 15 distinct) is a behavior of `Finish.tla`
-(`FinishTrace.tla`, a trace a deadlock where the model cannot take it).
-A model narrowed past the code (`Add` only with the bit clear) and code
-the model does not follow (`finished()` unparking with no sleeper, in a
-copy of the tree) are each rejected. The waker slot's and the park's
-traces are not yet checked.
+it. The models are not the code; Shuttle runs the code. The two are
+tied by trace validation: `tests/shuttle_finish.rs`, `shuttle_waker.rs`
+(its first test) and `shuttle_park.rs` (`owed_wakes_cascade`) log each
+operation `finish.rs`, `waker.rs` and `park.rs` make (their primitives
+log from inside Shuttle's own atomic step, so the log's order is the
+operations'), and `check.py` checks every schedule Shuttle runs is a
+behavior of its model (`FinishTrace.tla`, `WakerTrace.tla`,
+`ParkTrace.tla`: a trace a deadlock where the model cannot take it):
+9,000 schedules of the finish line (15 distinct), 3,000 of the waker
+slot (about 60) and 3,000 of the park (about 650). For each, a model
+narrowed past the code and code the model does not follow (in a copy of
+the tree) are rejected.
+
+Trace validation corrected the models where they had left the code:
+`Waker.tla` cleared the slot when the first check found the item done,
+where `Pipeline::poll_ready` and `poll_room` return without `clear`
+(leaving a stale Waker a later notify wakes, spuriously); it lacked
+`install_waker`'s fast path, woke the caller before `wake_slow` stores
+IDLE rather than after, and had no thread that notifies with nothing
+done. `Park.tla` read the parked count and owed the rest in one step,
+where `wake_for` does the two apart, and merged the park loop's load of
+the bit with its park, so a token left between them went unused where
+the code's park takes it. Each now follows the code, and the models'
+properties and controls hold. One gap the check found in Shuttle's
+tests: `shuttle_waker.rs`'s first test never takes `install_waker`'s
+fast path (every register after the first follows a wake that left the
+slot IDLE), and its second test, which does, is not validated.
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
