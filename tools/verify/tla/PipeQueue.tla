@@ -140,10 +140,11 @@ Worker(w) == Look(w) \/ Claim(w) \/ Run(w) \/ Recheck(w)
 Idle == opc = "idle" /\ fault = "none"
 Hand == Idle /\ made < Dispatches
 \* A slot's tasks.
-Tasks == /\ Hand /\ freeSlots # <<>>
-         /\ \E n \in 1..MaxPieces : Publish(n, <<"slot", Head(freeSlots), 0>>) /\ slotLeft' = [slotLeft EXCEPT ![Head(freeSlots)] = n]
-         /\ freeSlots' = Tail(freeSlots) /\ made' = made + 1
-         /\ UNCHANGED <<claimed, ran, take, running, freePieces, node, localRooms, room, group, blockOn, spinFor, opc, runs, slept>>
+TasksN(n) == /\ Hand /\ freeSlots # <<>>
+             /\ Publish(n, <<"slot", Head(freeSlots), 0>>) /\ slotLeft' = [slotLeft EXCEPT ![Head(freeSlots)] = n]
+             /\ freeSlots' = Tail(freeSlots) /\ made' = made + 1
+             /\ UNCHANGED <<claimed, ran, take, running, freePieces, node, localRooms, room, group, blockOn, spinFor, opc, runs, slept>>
+Tasks == \E n \in 1..MaxPieces : TasksN(n)
 \* A room piece: a node, and for a whole Room a room off the local ring.
 Piece(r) == /\ Hand /\ freePieces # <<>>
             /\ Publish(1, <<"piece", Head(freePieces), r>>)

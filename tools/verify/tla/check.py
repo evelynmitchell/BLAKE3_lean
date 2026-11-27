@@ -855,6 +855,85 @@ def check_slots_traces(tla_jar, models, lines):
     return check_traces(tla_jar, models, "PipeSlotsTrace", {"Msgs = 3\n          Slots = 2\n          Members = 2\n          Pieces = 2": (ts, len(lines))})
 
 
+def record_source(tree, build):
+    return record(tree, build, "shuttle_source", "SOURCE_TRACE")
+
+
+def queue_trace(line, tree=ROOT):
+    """One schedule of tests/shuttle_source.rs as PipeQueue.tla's actions:
+    the mode first (the owner runs waiting actions itself, "block", or not).
+    The owner's publishes are `published`'s stores, after the scenario's
+    note of what it hands out. A take (a worker's, or the owner's
+    run_waiting_action) reads `claimed`, then `published`, then
+    compares-and-swaps `claimed`; its read is placed where the model sees
+    what the code saw (this follows both counts): at the load of `claimed`
+    (or the failed swap that stands for it) if the model sees work there,
+    else at the load of `published`. A run is the scenario's note; a
+    worker's look again after its bit, its note (Settle); the owner's wait,
+    sleep, wake and finish, its notes."""
+    name, log = line.split(":", 1)
+    events = [e.split("|") for e in log.split(";")]
+    lines = open(os.path.join(tree, "threads", "src", "source.rs")).read().splitlines()
+    claimed = "source.rs:%d" % next(k + 1 for k, l in enumerate(lines) if "claimed: OwnLine(AtomicUsize::new(0))," in l)
+    out = [f'[a |-> "Mode", block |-> {"TRUE" if name == "block" else "FALSE"}]']
+    act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
+    published, now_claimed, kind = 0, 0, None
+    read = {}   # each taker's pending read: (its place in out, c, the model saw work there)
+    def who(thread):
+        return "owner" if thread == CALLER else "worker"
+    def look(thread, at=None):
+        a = '[a |-> "ORead"]' if who(thread) == "owner" else '[a |-> "Look", w |-> 1]'
+        out.insert(len(out) if at is None else at, a)
+    for (thread, s, op, old, new) in events:
+        if s == "note":
+            what, _, n = op.partition(" ")
+            if what in ("tasks", "piece", "group"):
+                kind = (what, n)
+            elif what == "ran":
+                act("ORun") if who(thread) == "owner" else act("Run", w=1)
+            elif what in ("again", "park", "woke"):
+                act("Settle", w=1)
+            elif what == "wait":
+                act("StartWait")
+            elif what == "sleep":
+                act("Sleep")
+            elif what == "woken":
+                act("Woken")
+            elif what == "finish":
+                act("Finish")
+        elif s == "published" and op == "store":
+            published = int(new)
+            what, n = kind
+            act("Tasks", n=n) if what == "tasks" else act("Piece") if what == "piece" else act("Group")
+        elif s == claimed and op == "load":
+            c = int(old)
+            read[thread] = (len(out), c, c < published)
+        elif s == claimed and op == "cas":
+            act("OClaim") if who(thread) == "owner" else act("Claim", w=1)
+            if new:
+                now_claimed = int(new)
+                read.pop(thread, None)
+            else:
+                c = int(old)
+                read[thread] = (len(out), c, c < published)
+        elif s == "published" and op == "load" and thread in read:
+            at, c, there = read.pop(thread)
+            p = int(old)
+            if c < p:
+                look(thread, at if there else None)
+            elif who(thread) == "worker":
+                look(thread)   # none: the worker sets its bit
+    return name, "<<" + ", ".join(out) + ">>"
+
+
+def check_queue_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against PipeQueue.tla (one worker,
+    one slot of two tasks, one room, one group, three dispatches)."""
+    ts = {queue_trace(line)[1] for line in lines}
+    return check_traces(tla_jar, models, "PipeQueueTrace",
+                        {"Workers = 1\n          Slots = 1\n          MaxPieces = 2\n          Rooms = 1\n          Groups = 1\n          Dispatches = 3": (ts, len(lines))})
+
+
 def record_pipeline(tree, build):
     """tests/shuttle_pipeline.rs's traced scenarios' schedules: {name: lines},
     each atomic named (site_names)."""
