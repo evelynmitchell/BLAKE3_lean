@@ -111,15 +111,137 @@ def jar():
     return path
 
 
-def tlc(tla_jar, directory, model):
-    """TLC on `model` in `directory`: (passed, its output's last lines)."""
+def tlc(tla_jar, directory, model, deadlock=False):
+    """TLC on `model` in `directory`: (passed, its output's last lines).
+    A deadlock is no error unless `deadlock` (the trace checks': a trace
+    the model cannot take further is one)."""
     with tempfile.TemporaryDirectory() as meta:
-        r = subprocess.run(["java", "-XX:+UseParallelGC", "-cp", tla_jar, "tlc2.TLC", "-workers", "auto", "-deadlock",
-                            "-nowarning", "-metadir", meta, "-config", model + ".cfg", model],
+        r = subprocess.run(["java", "-XX:+UseParallelGC", "-cp", tla_jar, "tlc2.TLC", "-workers", "auto"] + ([] if deadlock else ["-deadlock"]) +
+                           ["-nowarning", "-metadir", meta, "-config", model + ".cfg", model],
                            cwd=directory, capture_output=True, text=True)
     out = r.stdout + r.stderr
     passed = r.returncode == 0 and "Model checking completed. No error has been found." in out
     return passed, out
+
+
+# Trace validation (FinishTrace.tla): Shuttle's schedules of the real
+# finish.rs, logged by tests/shuttle_finish.rs's primitives, each checked
+# as a behavior of Finish.tla.
+SLEEPING = 1 << 63
+CALLER = "ThreadId { task_id: main-thread(0) }"
+
+
+def record_finish(tree, build):
+    """Run tests/shuttle_finish.rs in `tree` (a checkout), building in
+    `build`: each schedule's log, a line a schedule."""
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "trace")
+        env = dict(os.environ, FINISH_TRACE=out, RUSTFLAGS="--cfg shuttle", CARGO_TARGET_DIR=build)
+        r = subprocess.run(["cargo", "test", "-q", "--release", "--test", "shuttle_finish", "--", "--test-threads=1"],
+                           cwd=os.path.join(tree, "threads"), env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"check.py: tests/shuttle_finish.rs failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+        return open(out).read().splitlines()
+
+
+def finish_trace(pieces, line):
+    """One schedule's log as Finish.tla's actions, a TLA+ sequence. The
+    caller is the test's main thread: its loads of the count before it
+    sets its bit are polls, after it re-checks; past its return (a poll
+    that finds the count whole, or Clear) it is the test's. A finisher's
+    load of `published` is part of its Add."""
+    events = [e.rsplit(" ", 3) for e in line.split(";")]
+    out, done, slept, finishers = [], False, False, {}
+    for k, (thread, op, atomic, value) in enumerate(events):
+        if op == "store":
+            continue
+        if thread == CALLER:
+            if done:
+                continue
+            if op == "load" and atomic == "1" and not slept:
+                if int(value) & ~SLEEPING >= pieces:
+                    to, done = "done", True
+                else:
+                    after = next((o for (t, o, _, _) in events[k + 1:] if t == CALLER), None)
+                    to = "setbit" if after == "fetch_or" else "poll"
+                out.append(f'[a |-> "Poll", to |-> "{to}"]')
+            elif op == "fetch_or":
+                out.append('[a |-> "SetBit"]')
+                slept = True
+            elif op == "park":
+                out.append('[a |-> "Park"]')
+            elif op == "load" and atomic == "1":
+                out.append('[a |-> "Recheck"]')
+            elif op == "fetch_and":
+                out.append('[a |-> "Clear"]')
+                done = True
+            else:
+                sys.exit(f"check.py: the caller's {op} of atomic {atomic} is no Finish.tla action")
+        else:
+            f = finishers.setdefault(thread, len(finishers) + 1)
+            if op == "fetch_add":
+                out.append(f'[a |-> "Add", f |-> {f}]')
+            elif op == "unpark":
+                out.append(f'[a |-> "Unpark", f |-> {f}]')
+            elif not (op == "load" and atomic == "0"):
+                sys.exit(f"check.py: a finisher's {op} of atomic {atomic} is no Finish.tla action")
+    return "<<" + ", ".join(out) + ">>"
+
+
+def check_finish_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against Finish.tla as `models`
+    (a directory of the .tla files) states it: (passed, what TLC said)."""
+    traces = {}
+    for line in lines:
+        pieces, log = line.split("|", 1)
+        traces.setdefault(int(pieces), set()).add(finish_trace(int(pieces), log))
+    said = []
+    with tempfile.TemporaryDirectory() as d:
+        for f in os.listdir(models):
+            if f.endswith(".tla"):
+                shutil.copy(os.path.join(models, f), d)
+        for pieces, ts in sorted(traces.items()):
+            name = f"MCFinishTrace{pieces}"
+            with open(os.path.join(d, name + ".tla"), "w") as f:
+                f.write(f"---- MODULE {name} ----\nEXTENDS FinishTrace\nMCTraces == <<\n" + ",\n".join(sorted(ts)) + "\n>>\n====\n")
+            with open(os.path.join(d, name + ".cfg"), "w") as f:
+                f.write(f"SPECIFICATION TSpec\nCONSTANTS Finishers = {pieces}\n          Target = {pieces}\n          Traces <- MCTraces\nINVARIANT Ends\n")
+            passed, out = tlc(tla_jar, d, name, deadlock=True)
+            found = next((line for line in out.splitlines() if "Deadlock" in line or "violated" in line), "")
+            said.append(f"{pieces} finisher(s): {len(ts)} distinct schedules of {sum(1 for x in lines if x.startswith(f'{pieces}|'))}{', ' + found if found else ''}")
+            if not passed:
+                return False, "; ".join(said) + "\n" + out[-2500:]
+    return True, "; ".join(said)
+
+
+def trace_controls(tla_jar, lines):
+    """The trace check fails for a model narrowed past the code, and for
+    code the model does not follow: what each found (None: not caught)."""
+    import pipeline_model_controls
+    found = []
+    with tempfile.TemporaryDirectory() as d:
+        for f in os.listdir(HERE):
+            if f.endswith(".tla"):
+                shutil.copy(os.path.join(HERE, f), d)
+        path = os.path.join(d, "Finish.tla")
+        text = open(path).read()
+        old = "Add(f) ==    /\\ fpc[f] = \"add\""
+        assert text.count(old) == 1, "the Add guard"
+        open(path, "w").write(text.replace(old, old + " /\\ ~sleeping"))
+        passed, said = check_finish_traces(tla_jar, d, lines)
+        found.append(("Finish.tla's Add allowed only with the bit clear (narrower than the code)", passed, said))
+    # The code: a copy of the tree in the build directory, never the tree.
+    build = os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace-controls")
+    tree = os.path.join(build, "tree")
+    pipeline_model_controls.make_copy(tree)
+    path = os.path.join(tree, "threads", "src", "finish.rs")
+    text = open(path).read()
+    old = "if before & SLEEPING != 0 && (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {"
+    assert text.count(old) == 1, "finished()'s condition"
+    open(path, "w").write(text.replace(old, "if (before & !SLEEPING) + n == self.published.load(Ordering::SeqCst) {"))
+    passed, said = check_finish_traces(tla_jar, HERE, record_finish(tree, os.path.join(build, "target")))
+    found.append(("finish.rs's finished() unparks with no sleeper (the model does not)", passed, said))
+    return found
 
 
 def main(argv):
@@ -150,9 +272,19 @@ def main(argv):
             print(f"control {model}: {what}: {'NOT CAUGHT' if passed else 'caught'} {found.strip()}", flush=True)
             if passed:
                 failed.append(f"control: {what}")
+    lines = record_finish(ROOT, os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace"))
+    passed, said = check_finish_traces(tla_jar, HERE, lines)
+    print(f"traces FinishTrace: {'PASS' if passed else 'FAIL'} {said}", flush=True)
+    if not passed:
+        failed.append("traces: FinishTrace")
+    if "--models" not in argv:
+        for what, passed, said in trace_controls(tla_jar, lines):
+            print(f"control traces: {what}: {'NOT CAUGHT' if passed else 'caught'} {said.splitlines()[0]}", flush=True)
+            if passed:
+                failed.append(f"control: {what}")
     if failed:
         sys.exit(f"check.py: {', '.join(failed)}")
-    print("check.py: every model passes, and fails for each planted fault")
+    print("check.py: every model passes, every recorded schedule is a behavior of its model, and each fails for each planted fault")
 
 
 if __name__ == "__main__":
