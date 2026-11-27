@@ -181,16 +181,25 @@ mod tests {
     }
 
     #[test]
+    fn official_file_holds_test_cases() {
+        let parsed_lens: Vec<usize> = parse_test_cases().cases.iter().map(|c| c.input_len).collect();
+        assert_eq!(parsed_lens, TEST_CASES, "parsed case lengths must match TEST_CASES in order");
+    }
+
+    #[test]
     fn run_test_vectors() {
         blake3::initialize();
-        let cases = parse_test_cases();
-        assert_eq!(cases.key.as_bytes(), TEST_KEY, "parsed key must match TEST_KEY");
-        assert_eq!(cases.context_string, TEST_CONTEXT, "parsed context must match TEST_CONTEXT");
-        let parsed_lens: Vec<usize> = cases.cases.iter().map(|c| c.input_len).collect();
-        assert_eq!(parsed_lens, TEST_CASES, "parsed case lengths must match TEST_CASES in order");
+        for (file, json) in parse::FILES {
+            run_file(file, &parse::parse_json(json));
+        }
+    }
+
+    fn run_file(file: &str, cases: &Cases) {
+        assert_eq!(cases.key.as_bytes(), TEST_KEY, "{file}: parsed key must match TEST_KEY");
+        assert_eq!(cases.context_string, TEST_CONTEXT, "{file}: parsed context must match TEST_CONTEXT");
         let key: &[u8; blake3::KEY_LEN] = cases.key.as_bytes().try_into().unwrap();
         for case in &cases.cases {
-            dbg!(case.input_len);
+            dbg!(file, case.input_len);
             let mut input = vec![0; case.input_len];
             paint_test_input(&mut input);
             let expected_hash = parse::hex_decode(&case.hash);

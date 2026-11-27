@@ -26,16 +26,23 @@ fn pattern(len: usize) -> Vec<u8> {
 #[path = "../../test_vectors/src/parse.rs"]
 mod vectors;
 
-fn official_vectors() -> Vec<(usize, [[u8; 32]; 3])> {
-    let data = vectors::parse_json(include_str!("../../test_vectors/test_vectors.json"));
+/// Each case of a vector file: its length and its three digests.
+fn digests(json: &str) -> Vec<(usize, [[u8; 32]; 3])> {
+    let data = vectors::parse_json(json);
     let hex32 = |s: &str| -> [u8; 32] { vectors::hex_decode(&s[..64]).try_into().unwrap() };
     data.cases.iter().map(|c| (c.input_len, [hex32(&c.hash), hex32(&c.keyed_hash), hex32(&c.derive_key)])).collect()
 }
 
+/// Both vector files (official BLAKE3's and the Lean definition's).
 #[test]
-fn official_test_vectors_match_across_rooms_owned_and_lent() {
+fn test_vectors_match_across_rooms_owned_and_lent() {
     blake3_servil::initialize_multithreaded(None);
-    let cases = official_vectors();
+    for (_, json) in vectors::FILES {
+        across_rooms_owned_and_lent(&digests(json));
+    }
+}
+
+fn across_rooms_owned_and_lent(cases: &[(usize, [[u8; 32]; 3])]) {
     let max_len = cases.iter().map(|&(n, _)| n).max().unwrap_or(0);
     let data = pattern(max_len);
 

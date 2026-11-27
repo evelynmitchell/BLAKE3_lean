@@ -1,6 +1,14 @@
-//! Minimal, dependency-free JSON parser/formatter and hex codec for
-//! `test_vectors/test_vectors.json`, shared by `test_vectors`, `capi`, and
-//! `threads` tests.
+//! Minimal, dependency-free JSON parser/formatter and hex codec for the
+//! vector files, shared by `test_vectors`, `capi`, and `threads` tests.
+
+/// The vector files, by name, each test of them runs over both: official
+/// BLAKE3's outputs (`test_vectors.json`, 35 input lengths), and the Lean
+/// definition's (`lean_vectors.json`, written by
+/// `tools/verify/lean/Vectors.lean`: 138 lengths to 4 MiB, some with 33
+/// blocks of output). One format, key, context string and input pattern
+/// (byte i is i % 251).
+#[allow(dead_code)]
+pub const FILES: [(&str, &str); 2] = [("test_vectors.json", include_str!("../test_vectors.json")), ("lean_vectors.json", include_str!("../lean_vectors.json"))];
 
 #[derive(Debug)]
 pub struct Cases {
@@ -57,7 +65,7 @@ fn push_json_string(out: &mut String, s: &str) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c => {
-                assert!(c.is_ascii() && !c.is_ascii_control(), "unsupported JSON string character {c:?} in test_vectors.json");
+                assert!(c.is_ascii() && !c.is_ascii_control(), "unsupported JSON string character {c:?} in a vector file");
                 out.push(c);
             }
         }
@@ -147,7 +155,7 @@ impl<'a> Scanner<'a> {
                     // test_vectors.json uses strictly printable ASCII (plus the
                     // escaped controls handled above); reject raw controls and
                     // non-ASCII bytes cleanly.
-                    assert!(b.is_ascii() && b >= 0x20, "invalid JSON string byte {b:#x} in test_vectors.json");
+                    assert!(b.is_ascii() && b >= 0x20, "invalid JSON string byte {b:#x} in a vector file");
                     out.push(b as char);
                 }
             }
