@@ -969,8 +969,19 @@ properties and controls hold. `shuttle_waker.rs`'s first test never
 takes `install_waker`'s fast path (every register after the first
 follows a wake that left the slot IDLE), so a model without the fast
 path passed its traces; its second test takes it, and with its traces
-that model is rejected. The `Pipeline`'s models are not yet checked
-against the code's schedules (#31).
+that model is rejected. Of the `Pipeline`'s models, `PipeRooms.tla` is
+checked against `shuttle_pipeline.rs`'s
+`a_wait_for_a_room_ends_when_another_thread_drops_one` (7,000
+schedules, about 90 distinct): the shim's atomics know the line of
+`pipeline.rs` that made each (`#[track_caller]`), so the log names
+each room's count, piece flag and the waker slot with no change to
+`pipeline.rs`. The traces corrected it in three places: `block_on`
+polls a wait twice before it sleeps (`Repoll`, outside the fairness
+assumption), a re-check that finds a room free takes it before it
+clears the Waker, and the clear is a step of its own, so a notify can
+land between. A model whose waits poll again only once woken, and code
+whose Room drop wakes the owner on every drop, are each rejected. The
+other `Pipeline` models are not yet checked against the code (#31).
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
