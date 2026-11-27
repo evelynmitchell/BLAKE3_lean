@@ -7,8 +7,9 @@ import Theorems
 `leftCount n` of them. The library never evaluates it so: its `Hasher` pushes chunks on a stack of
 subtrees and merges as it goes (`src/hasher.rs`), and the pool and the grouped calls cut the input
 into subtrees, hash each on its own, and merge their values (`threads/src/lanes.rs`,
-`src/each.rs`); its stack may hold a subtree as a row of its parts' values, merged a layer at a
-time. This file writes those algorithms down and proves each gives the definition's
+`src/each.rs`); the `Hasher`'s stack may hold a subtree as a row of its parts' values, merged a
+layer at a time; and `b3sum --outboard` writes the tree above a file's 16 KiB groups, built a layer at a time
+and walked by index. This file writes those algorithms down and proves each gives the definition's
 result, for every input.
 
 The tree theorems are about the tree's shape, so they hold for any function merging two values
@@ -18,6 +19,8 @@ algorithms. The tests compare the Rust with the definition (`test_vectors/lean_v
 models here are what those tests' passing would be about. -/
 
 set_option linter.unusedSectionVars false
+-- `if_pos`, `if_neg`, `dif_neg`: their replacements take the condition as an equation.
+set_option linter.deprecated false
 
 namespace Blake3.Algorithms
 
@@ -550,6 +553,216 @@ theorem blake3_cut_and_merge (key : Vector Word 8) (mode : Word) (input : ByteAr
   rw [blake3_tree, cut_and_merge _ pieces last k ha hk h0 hl, hcut]
 
 
+/-! ## The outboard
+
+`b3sum --outboard` (`b3sum/src/outboard.rs`) writes the tree above a file's 16 KiB groups: each
+parent as its two children's values, in pre-order. It builds the values a layer at a time from the
+groups' (`build`), then walks them by index from the root (`node`). `lval` and `nodes` are those two,
+with a layer's count of whole values `whole`; `obao` is the specification's outboard, the pre-order
+of the tree over the groups. -/
+
+/-- The specification's outboard over values `vs` (the groups' trees): each parent of the tree over
+them as its two children's trees, in pre-order (the parent, its left subtree, its right subtree). -/
+def obao (vs : List α) : List (α × α) :=
+  if _ : vs.length ≤ 1 then []
+  else (treeOf merge (vs.take (leftCount vs.length)), treeOf merge (vs.drop (leftCount vs.length))) ::
+    (obao (vs.take (leftCount vs.length)) ++ obao (vs.drop (leftCount vs.length)))
+termination_by vs.length
+decreasing_by
+  · simp only [List.length_take]; have := leftCount_lt vs.length (by omega); omega
+  · simp only [List.length_drop]; have := leftCount_pos vs.length; omega
+
+/-- The values of layer `h` whole below its last, of `g` group values: `(g - 1) / 2^h`. -/
+def whole (g h : Nat) : Nat := (g - 1) / 2 ^ h
+
+/-- Value `j` of layer `h`, as `build` computes it: a group's own at layer 0; above, the parent of
+values `2j` and `2j + 1` below where `2j + 1` is a whole value or the last, else value `2j` passed
+up as it is. -/
+def lval (vs : List α) : Nat → Nat → α
+  | 0, j => vs[j]!
+  | h + 1, j => if 2 * j + 1 ≤ whole vs.length h then merge (lval vs h (2 * j)) (lval vs h (2 * j + 1)) else lval vs h (2 * j)
+
+/-- Node `i` of layer `h` and the nodes below it, in pre-order, as `node` writes them: a parent as
+its two children's values; one whose right child is past its layer is no parent. -/
+def nodes (vs : List α) : Nat → Nat → List (α × α)
+  | 0, _ => []
+  | h + 1, i =>
+    if whole vs.length h < 2 * i + 1 then nodes vs h (2 * i)
+    else (lval merge vs h (2 * i), lval merge vs h (2 * i + 1)) :: (nodes vs h (2 * i) ++ nodes vs h (2 * i + 1))
+
+/-- The groups under node `i` of layer `h`. -/
+def seg (vs : List α) (h i : Nat) : List α := (vs.drop (i * 2 ^ h)).take (2 ^ h)
+
+theorem seg_succ (vs : List α) (h i : Nat) : seg vs (h + 1) i = seg vs h (2 * i) ++ seg vs h (2 * i + 1) := by
+  simp only [seg]
+  rw [show (2 * i + 1) * 2 ^ h = 2 * i * 2 ^ h + 2 ^ h by rw [Nat.add_mul, Nat.one_mul],
+    show i * 2 ^ (h + 1) = 2 * i * 2 ^ h by rw [Nat.pow_succ]; ac_rfl, ← List.drop_drop,
+    Nat.pow_succ, Nat.mul_two, List.take_add]
+
+/-- Every value `build` computes is the tree of the groups under it, and every list of nodes `node`
+writes is the specification's outboard over them. -/
+theorem lval_nodes (vs : List α) (g : Nat) (hg : vs.length = g) : ∀ h i, i * 2 ^ h < g →
+    lval merge vs h i = treeOf merge (seg vs h i) ∧ nodes merge vs h i = obao merge (seg vs h i) := by
+  intro h
+  induction h with
+  | zero =>
+    intro i hi
+    simp only [Nat.pow_zero, Nat.mul_one] at hi
+    have hs : seg vs 0 i = [vs[i]] := by
+      simp only [seg, Nat.pow_zero, Nat.mul_one]
+      rw [List.drop_eq_getElem_cons (by omega)]; rfl
+    refine ⟨?_, ?_⟩
+    · rw [hs, treeOf_single, lval]; exact getElem!_pos vs i (by omega)
+    · rw [hs, nodes, obao]; simp
+  | succ h ih =>
+    intro i hi
+    have hp := Nat.two_pow_pos h
+    have hi2 : 2 * i * 2 ^ h < g := by rw [Nat.pow_succ] at hi; rw [show 2 * i * 2 ^ h = i * (2 ^ h * 2) by ac_rfl]; exact hi
+    obtain ⟨ihl, ihn⟩ := ih (2 * i) hi2
+    have hlen1 : (seg vs h (2 * i)).length = min (2 ^ h) (g - 2 * i * 2 ^ h) := by simp [seg, hg]
+    by_cases hw : whole g h < 2 * i + 1
+    · -- No right child: the groups past the left are none.
+      have hnone : seg vs h (2 * i + 1) = [] := by
+        simp only [seg, whole] at hw ⊢
+        have : g ≤ (2 * i + 1) * 2 ^ h := by
+          have := (Nat.div_lt_iff_lt_mul hp).1 hw; omega
+        rw [List.drop_of_length_le (by omega), List.take_nil]
+      rw [seg_succ, hnone, List.append_nil, lval, nodes, hg, if_neg (by omega), if_pos hw]
+      exact ⟨ihl, ihn⟩
+    · -- Both children: the left whole, the right of 1 to 2^h groups.
+      have hle : (2 * i + 1) * 2 ^ h ≤ g - 1 := (Nat.le_div_iff_mul_le hp).1 (by simp only [whole] at hw; omega)
+      obtain ⟨ihlr, ihnr⟩ := ih (2 * i + 1) (by omega)
+      have hl : (seg vs h (2 * i)).length = 2 ^ h := by rw [hlen1]; rw [Nat.add_mul, Nat.one_mul] at hle; omega
+      have hr0 : 0 < (seg vs h (2 * i + 1)).length := by simp [seg, hg]; omega
+      have hr : (seg vs h (2 * i + 1)).length ≤ 2 ^ h := by simp only [seg, List.length_take]; omega
+      have hsplit : leftCount (seg vs (h + 1) i).length = 2 ^ h := by
+        rw [seg_succ, List.length_append, hl, leftCount,
+          show 2 ^ h + (seg vs h (2 * i + 1)).length - 1 = 2 ^ h + ((seg vs h (2 * i + 1)).length - 1) by omega,
+          log2_add _ _ h hp (Nat.dvd_refl _) (by omega), Nat.log2_two_pow]
+      have hlen : 2 ≤ (seg vs (h + 1) i).length := by rw [seg_succ, List.length_append]; omega
+      have htake : (seg vs (h + 1) i).take (2 ^ h) = seg vs h (2 * i) := by
+        rw [seg_succ]; exact List.take_left' hl
+      have hdrop : (seg vs (h + 1) i).drop (2 ^ h) = seg vs h (2 * i + 1) := by
+        rw [seg_succ]; exact List.drop_left' hl
+      refine ⟨?_, ?_⟩
+      · rw [lval, hg, if_pos (by omega), ihl, ihlr, treeOf_split merge _ hlen, hsplit, htake, hdrop]
+      · conv => rhs; rw [obao]
+        rw [dif_neg (by omega), nodes, hg, if_neg hw, ihl, ihlr, ihn, ihnr, hsplit, htake, hdrop]
+
+/-- **The outboard.** Over `g ≥ 2` group values, with `H = log2 (g - 1)` the top layer (the one
+of one whole value): the nodes `node` writes from the root, node 0 of the layer above the top,
+are the specification's outboard, and the top's two values merge to the tree's root. -/
+theorem outboard (vs : List α) (hg : 2 ≤ vs.length) :
+    nodes merge vs ((vs.length - 1).log2 + 1) 0 = obao merge vs ∧
+      merge (lval merge vs (vs.length - 1).log2 0) (lval merge vs (vs.length - 1).log2 1) = treeOf merge vs := by
+  have hi := Nat.lt_log2_self (n := vs.length - 1)
+  have lo := Nat.log2_self_le (n := vs.length - 1) (by omega)
+  have hseg : seg vs ((vs.length - 1).log2 + 1) 0 = vs := by
+    simp only [seg, Nat.zero_mul, List.drop_zero]; exact List.take_of_length_le (by omega)
+  obtain ⟨hl, hn⟩ := lval_nodes merge vs vs.length rfl _ 0 (by simp; omega)
+  rw [hseg] at hl hn
+  refine ⟨hn, ?_⟩
+  rw [← hl, lval, if_pos ?_]
+  simp only [whole, Nat.mul_zero, Nat.zero_add]
+  exact (Nat.le_div_iff_mul_le (Nat.two_pow_pos _)).2 (by omega)
+
+/-- `xs` cut into groups of `s`: `⌈|xs| / s⌉` of them. -/
+theorem length_groups (s : Nat) (hs : 0 < s) : ∀ (xs : List α), (groups s xs).length = (xs.length + s - 1) / s := by
+  suffices ∀ n (xs : List α), xs.length = n → (groups s xs).length = (xs.length + s - 1) / s from fun xs => this _ xs rfl
+  intro n
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro xs hn
+    by_cases hx : xs = []
+    · subst hx; simp only [groups_nil, List.length_nil, Nat.zero_add]; exact (Nat.div_eq_of_lt (by omega)).symm
+    have h0 : 0 < xs.length := List.length_pos_iff.2 hx
+    rw [groups_cons s xs hs hx, List.length_cons, ih (xs.length - s) (by omega) (xs.drop s) (by simp)]
+    simp only [List.length_drop]
+    by_cases hle : s ≤ xs.length
+    · rw [show xs.length + s - 1 = (xs.length - s + s - 1) + s by omega, Nat.add_div_right _ hs]
+    · rw [show xs.length - s = 0 by omega]
+      rw [Nat.div_eq_of_lt (by omega), show xs.length + s - 1 = (xs.length - 1) + s by omega, Nat.add_div_right _ hs,
+        Nat.div_eq_of_lt (by omega)]
+
+/-- Past `2^b` elements, the tree splits at `2^b` times where the tree over its groups of `2^b`
+splits. -/
+theorem leftCount_groups (b n : Nat) (hn : 2 ^ b < n) :
+    leftCount n = 2 ^ b * leftCount ((n + 2 ^ b - 1) / 2 ^ b) := by
+  have hp := Nat.two_pow_pos b
+  have hq : (n + 2 ^ b - 1) / 2 ^ b - 1 = (n - 1) / 2 ^ b := by
+    rw [show n + 2 ^ b - 1 = (n - 1) + 2 ^ b by omega, Nat.add_div_right _ hp]; rfl
+  have q1 : 1 ≤ (n - 1) / 2 ^ b := (Nat.le_div_iff_mul_le hp).2 (by omega)
+  have lo := Nat.log2_self_le (n := (n - 1) / 2 ^ b) (by omega)
+  have hi := Nat.lt_log2_self (n := (n - 1) / 2 ^ b)
+  have hd := Nat.div_mul_le_self (n - 1) (2 ^ b)
+  have hm := Nat.lt_mul_div_succ (n - 1) hp
+  have h1 : ((n - 1) / 2 ^ b).log2 + b ≤ (n - 1).log2 :=
+    (Nat.le_log2 (by omega)).2 (by rw [Nat.pow_add]; exact Nat.le_trans (Nat.mul_le_mul_right _ lo) hd)
+  have h2 : (n - 1).log2 < ((n - 1) / 2 ^ b).log2 + b + 1 := by
+    apply (Nat.log2_lt (by omega)).2
+    rw [show ((n - 1) / 2 ^ b).log2 + b + 1 = (((n - 1) / 2 ^ b).log2 + 1) + b by omega, Nat.pow_add]
+    exact Nat.lt_of_lt_of_le hm (by rw [Nat.mul_comm]; exact Nat.mul_le_mul_right _ hi)
+  rw [leftCount, leftCount, hq, show (n - 1).log2 = ((n - 1) / 2 ^ b).log2 + b by omega, Nat.pow_add, Nat.mul_comm]
+
+/-- **Groups lift.** The tree over a list is the tree over its groups' trees, for groups of any
+power of two: the tree over a file's 16 KiB groups, which the outboard holds, is the file's. -/
+theorem treeOf_row (b : Nat) : ∀ (xs : List α), xs ≠ [] → treeOf merge xs = treeOf merge (row merge (2 ^ b) xs) := by
+  suffices ∀ n (xs : List α), xs.length = n → xs ≠ [] → treeOf merge xs = treeOf merge (row merge (2 ^ b) xs) from
+    fun xs => this _ xs rfl
+  intro n
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro xs hn hx
+    have hp := Nat.two_pow_pos b
+    have h0 : 0 < xs.length := List.length_pos_iff.2 hx
+    by_cases hs : xs.length ≤ 2 ^ b
+    · rw [row, groups_cons _ xs hp hx, List.take_of_length_le hs, List.drop_of_length_le hs, groups_nil,
+        List.map_cons, List.map_nil, treeOf_single]
+    -- The split: the left part's groups are the left part of the groups.
+    have hL := leftCount_groups b xs.length (by omega)
+    have hg : (row merge (2 ^ b) xs).length = (xs.length + 2 ^ b - 1) / 2 ^ b := by
+      rw [row, List.length_map, length_groups _ hp]
+    have hg2 : 2 ≤ (xs.length + 2 ^ b - 1) / 2 ^ b := (Nat.le_div_iff_mul_le hp).2 (by omega)
+    have hlt := leftCount_lt xs.length (by omega)
+    have hpos := leftCount_pos xs.length
+    have hrows : row merge (2 ^ b) xs = row merge (2 ^ b) (xs.take (leftCount xs.length)) ++ row merge (2 ^ b) (xs.drop (leftCount xs.length)) := by
+      rw [row, row, row, ← List.map_append, ← groups_append _ hp _ _ (by simp; rw [Nat.min_eq_left (by omega), hL]; exact Nat.dvd_mul_right _ _),
+        List.take_append_drop]
+    have hleft : (row merge (2 ^ b) (xs.take (leftCount xs.length))).length = leftCount (row merge (2 ^ b) xs).length := by
+      rw [hg, row, List.length_map, length_groups _ hp, List.length_take, Nat.min_eq_left (by omega), hL,
+        show 2 ^ b * leftCount ((xs.length + 2 ^ b - 1) / 2 ^ b) + 2 ^ b - 1 = (2 ^ b - 1) + leftCount ((xs.length + 2 ^ b - 1) / 2 ^ b) * 2 ^ b by
+          rw [Nat.mul_comm]; omega,
+        Nat.add_mul_div_right _ _ hp, Nat.div_eq_of_lt (by omega), Nat.zero_add]
+    have hA : (xs.take (leftCount xs.length)).length < n := by rw [List.length_take]; omega
+    have hB : (xs.drop (leftCount xs.length)).length < n := by rw [List.length_drop]; omega
+    have hA0 : xs.take (leftCount xs.length) ≠ [] := by
+      intro h; have := congrArg List.length h; rw [List.length_take, List.length_nil] at this; omega
+    have hB0 : xs.drop (leftCount xs.length) ≠ [] := by
+      intro h; have := congrArg List.length h; rw [List.length_drop, List.length_nil] at this; omega
+    rw [treeOf_split merge xs (by omega), treeOf_split merge (row merge (2 ^ b) xs) (by omega), ← hleft, hrows,
+      List.take_left' rfl, List.drop_left' rfl,
+      ← ih _ hA (xs.take (leftCount xs.length)) rfl hA0, ← ih _ hB (xs.drop (leftCount xs.length)) rfl hB0]
+
+/-- **The outboard, for BLAKE3.** For an input of more than one group of 16 chunks (16 KiB), over
+its groups' trees: the parent pairs `b3sum --outboard` writes are the specification's outboard,
+and the top layer's two values merge to the root, so the hash is the definition's. -/
+theorem blake3_outboard (key : Vector Word 8) (mode : Word) (input : ByteArray) (outLen : Nat)
+    (h : 16 < (chunkNodes key mode input).size) :
+    let vs := row (parent key mode) (2 ^ 4) (chunkNodes key mode input).toList
+    nodes (parent key mode) vs ((vs.length - 1).log2 + 1) 0 = obao (parent key mode) vs ∧
+      blake3 key mode input outLen =
+        output (parent key mode (lval (parent key mode) vs (vs.length - 1).log2 0)
+          (lval (parent key mode) vs (vs.length - 1).log2 1)) outLen := by
+  intro vs
+  have hv : 2 ≤ vs.length := by
+    simp only [vs, row, List.length_map, length_groups _ (Nat.two_pow_pos 4), Array.length_toList]
+    exact (Nat.le_div_iff_mul_le (Nat.two_pow_pos 4)).2 (by simp; omega)
+  obtain ⟨hn, hr⟩ := outboard (parent key mode) vs hv
+  refine ⟨hn, ?_⟩
+  have hne : (chunkNodes key mode input).toList ≠ [] := by
+    intro e; have := congrArg List.length e; rw [Array.length_toList, List.length_nil] at this; omega
+  rw [hr, blake3_tree, treeOf_row (parent key mode) 4 _ hne]
+
 end Blake3.Algorithms
 
 #print axioms Blake3.Algorithms.tree_eq
@@ -561,6 +774,10 @@ end Blake3.Algorithms
 #print axioms Blake3.Algorithms.merge_rows
 #print axioms Blake3.Algorithms.merge_rows_value
 #print axioms Blake3.Algorithms.layer_append
+#print axioms Blake3.Algorithms.lval_nodes
+#print axioms Blake3.Algorithms.outboard
+#print axioms Blake3.Algorithms.treeOf_row
+#print axioms Blake3.Algorithms.blake3_outboard
 #print axioms Blake3.Algorithms.output_prefix
 #print axioms Blake3.Algorithms.output_block
 #print axioms Blake3.Algorithms.chunk_counter
