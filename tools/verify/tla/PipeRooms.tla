@@ -13,7 +13,9 @@
    The owner makes `Commits` commits, each from a free room or the Room it
    holds, then waits for every piece's event. Waits use the WakerSlot's
    contract, which Waker.tla checks: register, re-check, and a notify after
-   it wakes the waiter. `gen` counts each room's hand-outs: a piece reads
+   it wakes the waiter. A re-check that finds a room free takes it, then
+   clears the Waker (poll_room, poll_ready); a wait may poll again with no
+   wake (block_on polls once more before it sleeps). `gen` counts each room's hand-outs: a piece reads
    its room's bytes of the hand-out it was committed from.
 
    `Credits` is 3 here, against 2^30 in the code: the count's arithmetic
@@ -43,21 +45,24 @@ Init == /\ refs = [r \in R |-> 0] /\ gen = [r \in R |-> 0]
 
 Free(r) == refs[r] = 0 /\ holder[r] = "none"
 Notify == IF registered THEN registered' = FALSE /\ woken' = TRUE ELSE UNCHANGED <<registered, woken>>
+\* A free room handed out with all its credits (try_take_room, init_taken).
+Take == \E r \in R : /\ Free(r)
+                     /\ refs' = [refs EXCEPT ![r] = Credits] /\ gen' = [gen EXCEPT ![r] = gen[r] + 1]
+                     /\ holder' = [holder EXCEPT ![r] = "owner"] /\ commits' = [commits EXCEPT ![r] = 0] /\ held' = r
 
 (* The owner *)
 \* room(): take a free room (try_take_room), else wait: register, re-check.
 TakeRoom ==   /\ opc = "room" /\ made < Commits
               /\ IF held # 0 THEN opc' = "commit" /\ UNCHANGED <<refs, gen, holder, commits, held, registered>>
                  ELSE IF \E r \in R : Free(r)
-                 THEN \E r \in R : /\ Free(r)
-                                   /\ refs' = [refs EXCEPT ![r] = Credits] /\ gen' = [gen EXCEPT ![r] = gen[r] + 1]
-                                   /\ holder' = [holder EXCEPT ![r] = "owner"] /\ commits' = [commits EXCEPT ![r] = 0]
-                                   /\ held' = r /\ opc' = "commit" /\ UNCHANGED registered
+                 THEN Take /\ opc' = "commit" /\ UNCHANGED registered
                  ELSE registered' = TRUE /\ opc' = "roomcheck" /\ UNCHANGED <<refs, gen, holder, commits, held>>
               /\ UNCHANGED <<piece, made, woken>>
+\* The re-check takes a room if one is free (and then clears its Waker).
 RoomCheck ==  /\ opc = "roomcheck"
-              /\ IF \E r \in R : Free(r) THEN registered' = FALSE /\ opc' = "room" ELSE opc' = "roomwait" /\ UNCHANGED registered
-              /\ UNCHANGED <<refs, gen, holder, commits, piece, made, woken, held>>
+              /\ IF \E r \in R : Free(r) THEN Take /\ opc' = "roomclear"
+                 ELSE opc' = "roomwait" /\ UNCHANGED <<refs, gen, holder, commits, held>>
+              /\ UNCHANGED <<piece, made, registered, woken>>
 RoomWait ==   /\ opc = "roomwait" /\ woken
               /\ woken' = FALSE /\ opc' = "room"
               /\ UNCHANGED <<refs, gen, holder, commits, piece, made, registered, held>>
@@ -97,12 +102,20 @@ Events ==     /\ opc = "events"
                  ELSE registered' = TRUE /\ opc' = "eventcheck"
               /\ UNCHANGED <<refs, gen, holder, commits, piece, made, woken, held>>
 EventCheck == /\ opc = "eventcheck"
-              /\ IF \A p \in P : piece[p].done THEN registered' = FALSE /\ opc' = "finished"
-                 ELSE opc' = "eventwait" /\ UNCHANGED registered
+              /\ opc' = IF \A p \in P : piece[p].done THEN "eventclear" ELSE "eventwait"
+              /\ UNCHANGED <<refs, gen, holder, commits, piece, made, registered, woken, held>>
+\* Found what it waited for: the Waker cleared (WakerSlot::clear), after.
+Clear ==      /\ opc \in {"roomclear", "eventclear"}
+              /\ registered' = FALSE /\ opc' = IF opc = "roomclear" THEN "commit" ELSE "finished"
               /\ UNCHANGED <<refs, gen, holder, commits, piece, made, woken, held>>
 EventWait ==  /\ opc = "eventwait" /\ woken
               /\ woken' = FALSE /\ opc' = "events"
               /\ UNCHANGED <<refs, gen, holder, commits, piece, made, registered, held>>
+\* A wait polled again with no wake: block_on polls once more before it
+\* sleeps. Outside the fairness assumption: no liveness rests on it.
+Repoll ==     /\ opc \in {"roomwait", "eventwait"}
+              /\ opc' = IF opc = "roomwait" THEN "room" ELSE "events"
+              /\ UNCHANGED <<refs, gen, holder, commits, piece, made, registered, woken, held>>
 
 (* Another thread, holding a Room it was handed: it drops it. *)
 OtherDrop(r) == /\ holder[r] = "other"
@@ -126,9 +139,9 @@ Publish(p) == /\ piece[p].pc = "publish"
               /\ Notify
               /\ UNCHANGED <<refs, gen, holder, commits, made, opc, held>>
 
-Owner == TakeRoom \/ RoomCheck \/ RoomWait \/ Commit \/ After \/ OwnerDrop \/ EndCommits \/ Events \/ EventCheck \/ EventWait
+Owner == TakeRoom \/ RoomCheck \/ RoomWait \/ Commit \/ After \/ OwnerDrop \/ EndCommits \/ Events \/ EventCheck \/ EventWait \/ Clear
 Worker(p) == Read(p) \/ Hash(p) \/ Release(p) \/ Publish(p)
-Next == Owner \/ (\E r \in R : OtherDrop(r)) \/ \E p \in P : Worker(p)
+Next == Owner \/ Repoll \/ (\E r \in R : OtherDrop(r)) \/ \E p \in P : Worker(p)
 Spec == Init /\ [][Next]_vars /\ WF_vars(Owner) /\ \A r \in R : WF_vars(OtherDrop(r)) /\ \A p \in P : WF_vars(Worker(p))
 
 (* A piece reads its room's bytes of the hand-out it was committed from: the

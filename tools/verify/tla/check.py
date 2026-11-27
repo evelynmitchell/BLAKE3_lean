@@ -20,10 +20,11 @@ names of the actions follow the functions they model, for a reader to
 compare.
 
 Then the models are checked against the code (trace validation): the
-Shuttle tests of finish.rs, waker.rs (both) and park.rs
-(owed_wakes_cascade) log every schedule, operation by operation, and each
-log, turned into its model's actions, must be a behavior of the model
-(FinishTrace.tla, WakerTrace.tla, ParkTrace.tla).
+Shuttle tests of finish.rs, waker.rs (both), park.rs (owed_wakes_cascade)
+and the Pipeline (shuttle_pipeline.rs's wait for a Room) log every
+schedule, operation by operation, and each log, turned into its model's
+actions, must be a behavior of the model (FinishTrace.tla,
+WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla).
 
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
@@ -476,6 +477,122 @@ def finish_trace(pieces, line):
     return "<<" + ", ".join(out) + ">>"
 
 
+SRC = os.path.join(ROOT, "threads", "src")
+CREDITS = 1 << 30
+
+def site(file, text):
+    """Where in `file` (threads/src) the atomic `text` names is made: file:line."""
+    lines = open(os.path.join(SRC, file)).read().splitlines()
+    found = [k + 1 for k, l in enumerate(lines) if text in l]
+    if len(found) != 1:
+        sys.exit(f"check.py: {text!r} is not in {file} once")
+    return f"{file}:{found[0]}"
+
+REFS = site("pipeline.rs", "refs: (0..count).map(|_| AtomicUsize::new(0)).collect(),")
+DONE = site("pipeline.rs", "done: OwnLine(AtomicBool::new(true)),")
+WOKEN = site("pipeline.rs", "static BLOCK_ON_PARK: Arc<ThreadPark>")
+STATE = site("waker.rs", "WakerSlot { state: Line(AtomicUsize::new(IDLE))")
+
+def rooms_trace(line):
+    """One schedule of tests/shuttle_pipeline.rs's
+    a_wait_for_a_room_ends_when_another_thread_drops_one as PipeRooms.tla's
+    actions. The atomics are known by where pipeline.rs makes them (`site`):
+    a Room handed out is its count's store of all its credits; a commit, a
+    piece's `done` stored false; a release (a worker's, or the owner's
+    running an action itself), a subtraction of 1 from the count, its read
+    and hash just before; its publish, its `done` swapped true; a Room's
+    drop, the subtraction of its unspent credits, on the owner's thread or
+    another's. The owner's waits: a register is the waker slot's store of
+    REGISTERED, placed at the failing check just before it (TakeRoom,
+    Events); the check after it is RoomCheck or EventCheck (the room's
+    count; the last piece's `done`, drain_pieces' load); the slot's clear
+    after, Clear; a park token taken, RoomWait or EventWait; a poll with
+    none, Repoll."""
+    events = [e.split("|") for e in line.split(";")]
+    owner = CALLER
+    out, phase, made, pending = [], "start", 0, None
+    piece = {}
+    total = sum(1 for (t, s, a, op, o, n) in events if t == owner and s == DONE and op == "store" and o == "true")
+    act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
+    def own_piece(k, thread):
+        a = next(a for (t, s, a, op, o, n) in events[k + 1:] if t == thread and s == DONE and op == "swap")
+        return piece[a]
+    k = 0
+    while k < len(events):
+        thread, s, a, op, old, new = events[k]
+        k += 1
+        if thread == owner and phase not in ("finished",):
+            if phase == "after" and not (s == REFS and op == "sub" and int(old) - int(new) > 1) and s in (REFS, STATE):
+                act("After", k='"other"'); phase = "room"
+            if s == REFS and op == "load":
+                if phase == "roomwait":
+                    act("Repoll"); phase = "room"
+                if phase == "room" and old != "0":
+                    pending = len(out)
+                elif phase == "roomcheck" and old != "0":
+                    act("RoomCheck"); phase = "roomwait"
+            elif s == REFS and op == "store" and new == str(CREDITS):
+                if phase == "roomwait":
+                    act("Repoll"); phase = "room"
+                if phase == "roomcheck":
+                    act("RoomCheck"); phase = "roomclear"
+                else:
+                    act("TakeRoom"); phase = "held"
+            elif s == REFS and op == "sub" and int(old) - int(new) > 1:
+                act("After", k='"drop"'); act("OwnerDrop")
+                if made == total:
+                    act("EndCommits"); phase = "events"
+                else:
+                    phase = "room"
+            elif s == REFS and op == "sub":
+                p = own_piece(k - 1, thread); act("Read", p=p); act("Hash", p=p); act("Release", p=p)
+            elif s == DONE and op == "store" and old == "true" and new == "false":
+                made += 1; piece[a] = made; act("Commit"); phase = "after"
+            elif s == DONE and op == "swap" and new == "true":
+                act("Publish", p=piece[a])
+            elif s == STATE and phase in ("roomclear", "eventclear") and ((op == "store" and new == "0") or (op == "load" and old == "0")):
+                act("Clear"); phase = "held" if phase == "roomclear" else "finished"
+            elif s == STATE and op == "store" and old == "1" and new == "2" and phase in ("room", "events"):
+                out.insert(pending, '[a |-> "TakeRoom"]' if phase == "room" else '[a |-> "Events"]')
+                phase = "roomcheck" if phase == "room" else "eventcheck"
+            elif s == DONE and op == "load" and phase in ("events", "eventcheck", "eventwait") and piece.get(a) == made:
+                if phase == "eventwait":
+                    act("Repoll"); phase = "events"
+                if phase == "events":
+                    if old == "true":
+                        act("Events"); phase = "finished"
+                    else:
+                        pending = len(out)
+                elif phase == "eventcheck":
+                    act("EventCheck"); phase = "eventclear" if old == "true" else "eventwait"
+            elif s == WOKEN and op == "swap" and old == "true":
+                if phase == "roomwait":
+                    act("RoomWait"); phase = "room"
+                elif phase == "eventwait":
+                    act("EventWait"); phase = "events"
+        elif thread != owner:
+            if s == REFS and op == "sub":
+                if int(old) - int(new) == 1:
+                    p = own_piece(k - 1, thread); act("Read", p=p); act("Hash", p=p); act("Release", p=p)
+                else:
+                    if phase == "after":
+                        act("After", k='"other"'); phase = "room"
+                    act("OtherDrop", r=1)
+            elif s == DONE and op == "swap" and new == "true":
+                act("Publish", p=piece[a])
+    return "<<" + ", ".join(out) + ">>"
+
+
+def record_pipeline(tree, build):
+    return [line.split(":", 1)[1] for line in record(tree, build, "shuttle_pipeline", "PIPELINE_TRACE") if line.startswith("room_wait:")]
+
+
+def check_rooms_traces(tla_jar, models, lines):
+    """Every distinct schedule in `lines` against PipeRooms.tla (one Room, two commits)."""
+    ts = {rooms_trace(line) for line in lines}
+    return check_traces(tla_jar, models, "PipeRoomsTrace", {"Rooms = 1\n          Credits = 3\n          Commits = 2": (ts, len(lines))})
+
+
 def check_traces(tla_jar, models, spec, groups, extends=None):
     """Every distinct trace against `spec` (FinishTrace, WakerTrace), with
     `models` a directory of the .tla files. `groups` maps a configuration
@@ -543,7 +660,7 @@ def code_control(tla_jar, source, old, new, recorder, check):
     return check(tla_jar, HERE, recorder(tree, os.path.join(build, "target")))
 
 
-def trace_controls(tla_jar, finish_lines, waker_lines, park_lines):
+def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline_lines):
     """The trace checks fail for a model narrowed past the code, and for
     code the model does not follow: (what, passed, what TLC said)."""
     return [
@@ -566,6 +683,12 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines):
         ("Park.tla's payer reads the owed word only while something is owed (narrower than the code)",
          *model_control(tla_jar, "Park.tla", 'PayLoad(w) == /\\ wpc[w] = "payload"', 'PayLoad(w) == /\\ wpc[w] = "payload" /\\ owedCount > 0',
                         check_park_traces, park_lines)),
+        ("PipeRooms.tla's waits poll again only once woken (narrower than the code: block_on polls twice)",
+         *model_control(tla_jar, "PipeRooms.tla", 'Repoll ==     /\\ opc \\in {"roomwait", "eventwait"}',
+                        'Repoll ==     /\\ opc \\in {"roomwait", "eventwait"} /\\ woken', check_rooms_traces, pipeline_lines)),
+        ("pipeline.rs's Room::drop wakes the owner on every drop, not only the one that frees the room (the model does not)",
+         *code_control(tla_jar, "threads/src/pipeline.rs", "        } else if prev == unused {\n            // Even if Pipeline::drop races",
+                       "        } else {\n            // Even if Pipeline::drop races", record_pipeline, check_rooms_traces)),
         ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
          *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
                        "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
@@ -602,14 +725,15 @@ def main(argv):
                 failed.append(f"control: {what}")
     build = os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace")
     finish_lines, waker_lines, park_lines = record_finish(ROOT, build), record_waker(ROOT, build), record_park(ROOT, build)
+    pipeline_lines = record_pipeline(ROOT, build)
     for spec, check, lines in [("FinishTrace", check_finish_traces, finish_lines), ("WakerTrace", check_waker_traces, waker_lines),
-                               ("ParkTrace", check_park_traces, park_lines)]:
+                               ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline_lines)]:
         passed, said = check(tla_jar, HERE, lines)
         print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
         if not passed:
             failed.append(f"traces: {spec}")
     if "--models" not in argv:
-        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines):
+        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline_lines):
             print(f"control traces: {what}: {'NOT CAUGHT' if passed else 'caught'} {said.splitlines()[0]}", flush=True)
             if passed:
                 failed.append(f"control: {what}")

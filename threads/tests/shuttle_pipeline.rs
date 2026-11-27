@@ -48,14 +48,108 @@
 #![cfg(shuttle)]
 #![allow(dead_code, unused_imports)]
 
+/// The log of a traced scenario, for trace validation
+/// (tools/verify/tla/check.py): each atomic operation src/pipeline.rs and
+/// src/waker.rs make, logged from inside Shuttle's own step, so the log's
+/// order is the operations'; and the scenario's own steps. With
+/// `PIPELINE_TRACE` set, each schedule of a traced scenario is a line of
+/// that file, after the scenario's name.
+mod trace {
+    static ON: std::sync::Mutex<Option<(&'static str, Vec<String>)>> = std::sync::Mutex::new(None);
+
+    /// An operation: the thread, where the atomic was made (file and
+    /// line), its address, the operation, the value before and after.
+    pub fn log(site: &core::panic::Location<'_>, at: usize, op: &str, old: &str, new: &str) {
+        if let Some((_, lines)) = ON.lock().unwrap().as_mut() {
+            let id = format!("{:?}", shuttle::thread::current().id());
+            let file = site.file().rsplit('/').next().unwrap_or("");
+            lines.push(format!("{id}|{file}:{}|{at:x}|{op}|{old}|{new}", site.line()));
+        }
+    }
+    /// A step of the scenario's own (a commit, a message ended).
+    #[track_caller]
+    pub fn note(what: &str) {
+        log(core::panic::Location::caller(), 0, what, "", "");
+    }
+    pub fn start(name: &'static str) {
+        *ON.lock().unwrap() = Some((name, Vec::new()));
+    }
+    pub fn write() {
+        let Some((name, lines)) = ON.lock().unwrap().take() else { return };
+        if let Some(path) = std::env::var_os("PIPELINE_TRACE") {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+            f.write_all(format!("{name}:{}\n", lines.join(";")).as_bytes()).unwrap();
+        }
+    }
+}
+
 /// Shuttle's primitives, under the names src/pipeline.rs imports. A cell
 /// access is a point where threads may switch: the Pipeline's cells are
 /// handed between the caller and the workers by its atomics, and a
 /// handing-over that is wrong must be able to show.
 mod pipeline_sync {
     pub use shuttle::sync::Mutex;
-    pub use shuttle::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    pub use shuttle::sync::atomic::Ordering;
     pub use shuttle::thread_local;
+
+    /// Shuttle's atomics, each knowing the line of src/pipeline.rs that
+    /// made it (`#[track_caller]`), its operations logged while a scenario
+    /// is traced (`crate::trace`).
+    macro_rules! logged {
+        ($name:ident, $int:ty) => {
+            pub struct $name {
+                inner: shuttle::sync::atomic::$name,
+                site: &'static core::panic::Location<'static>,
+            }
+            impl $name {
+                #[track_caller]
+                pub fn new(v: $int) -> Self {
+                    $name { inner: shuttle::sync::atomic::$name::new(v), site: core::panic::Location::caller() }
+                }
+                fn op(&self, op: &str, f: impl Fn($int) -> Option<$int>) -> Result<$int, $int> {
+                    let o = Ordering::SeqCst;
+                    self.inner.fetch_update(o, o, |x| {
+                        let new = f(x);
+                        crate::trace::log(self.site, self as *const Self as usize, op, &format!("{x:?}"), &new.map_or(String::new(), |n| format!("{n:?}")));
+                        new
+                    })
+                }
+                pub fn load(&self, _: Ordering) -> $int {
+                    self.op("load", |_| None).unwrap_or_else(|x| x)
+                }
+                pub fn store(&self, v: $int, _: Ordering) {
+                    let _ = self.op("store", |_| Some(v));
+                }
+                pub fn swap(&self, v: $int, _: Ordering) -> $int {
+                    self.op("swap", |_| Some(v)).unwrap_or_else(|x| x)
+                }
+                pub fn compare_exchange(&self, current: $int, new: $int, _: Ordering, _: Ordering) -> Result<$int, $int> {
+                    self.op("cas", |x| (x == current).then_some(new))
+                }
+            }
+        };
+    }
+    macro_rules! arithmetic {
+        ($name:ident, $int:ty) => {
+            impl $name {
+                pub fn fetch_add(&self, v: $int, _: Ordering) -> $int {
+                    self.op("add", |x| Some(x.wrapping_add(v))).unwrap_or_else(|x| x)
+                }
+                pub fn fetch_sub(&self, v: $int, _: Ordering) -> $int {
+                    self.op("sub", |x| Some(x.wrapping_sub(v))).unwrap_or_else(|x| x)
+                }
+                pub fn fetch_or(&self, v: $int, _: Ordering) -> $int {
+                    self.op("or", |x| Some(x | v)).unwrap_or_else(|x| x)
+                }
+            }
+        };
+    }
+    logged!(AtomicBool, bool);
+    logged!(AtomicU64, u64);
+    logged!(AtomicUsize, usize);
+    arithmetic!(AtomicU64, u64);
+    arithmetic!(AtomicUsize, usize);
     /// Shuttle's threads. A caller about to sleep lets the held-back
     /// workers go (lanes::sources::hold_back): they are who would wake it.
     pub mod thread {
@@ -92,9 +186,10 @@ mod pipeline_sync {
     }
 }
 
-/// As tests/shuttle_waker.rs has it.
+/// As tests/shuttle_waker.rs has it, the state word logged.
 mod waker_sync {
-    pub use shuttle::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+    pub use crate::pipeline_sync::AtomicUsize;
+    pub use shuttle::sync::atomic::{AtomicBool, Ordering, fence};
     pub struct UnsafeCell<T> {
         busy: AtomicBool,
         inner: core::cell::UnsafeCell<T>,
@@ -594,6 +689,7 @@ fn a_room_outlives_its_pipeline() {
 /// November 19, 2026, by a count of the Rooms the calling program held.
 fn a_wait_for_a_room_ends_when_another_thread_drops_one() {
     check(|| {
+        trace::start("room_wait");
         with_workers(1, || {
             let (inputs, want) = inputs_of(&[ROOM_LEN + 7]);
             let mut pipe = Pipeline::<usize, ()>::new(Mode::Plain, Limits { messages: 1, rooms: 1 });
@@ -613,6 +709,7 @@ fn a_wait_for_a_room_ends_when_another_thread_drops_one() {
             pipe.end(message);
             drain(&mut pipe, 1, &want);
         });
+        trace::write();
     });
 }
 
