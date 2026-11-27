@@ -29,7 +29,7 @@ is missing. It writes each check's log and the table below to
 
 ## Results
 
-The quick tier, in the order run. Times include building.
+The quick tier, in the order run.
 
 | Check | Layer | Result | Note |
 |---|---|---|---|
@@ -37,15 +37,15 @@ The quick tier, in the order run. Times include building.
 | `lean_emit` | Lean specification | PASS | `compress.json` and `Generic.lean` regenerate to the committed bytes |
 | `proof_helpers` | Machine-code proofs (Z3) | PASS | |
 | `unsafe_reasons` | unsafe Rust | PASS | |
-| `core_tests` | Rust tests | PASS | |
-| `threads_tests` | Rust tests | PASS | |
+| `core_tests` | Rust tests | PASS | 264 tests |
+| `threads_tests` | Rust tests | PASS | 177 tests |
 | `test_vectors` | Rust tests | PASS | |
-| `b3sum_tests` | Rust tests | FAIL, exit 101 | the documented command names a library target `b3sum` does not have: finding 1 |
+| `b3sum_tests` | Rust tests | FAIL as documented, PASS as corrected | the documented command named a library target `b3sum` does not have: finding 1 |
 | `capi_tests` | Rust tests | SKIPPED | no `cargo-capi` on PATH |
 | `shuttle` | Thread schedules | PASS | |
-| `pipeline_controls` | Thread schedules | PENDING | still running when this was committed |
-| `waker_order` | Thread schedules | PENDING | |
-| `b3sum_controls` | b3sum I/O | PENDING | |
+| `pipeline_controls` | Thread schedules | PASS | the model fails for each of the ten planted faults |
+| `waker_order` | Thread schedules | PASS | after `rustup target add aarch64-apple-darwin`: finding 4 |
+| `b3sum_controls` | b3sum I/O | PASS | |
 
 The long tier (every `prove_*.py`, the proofs' mutants, the CPU
 cross-checks, whole-crate mutation testing) was not run: see below.
@@ -115,8 +115,7 @@ by number.
    `cargo nextest run --release --manifest-path b3sum/Cargo.toml --lib --tests`.
    Cargo stops with "no library targets found in package `b3sums`", so no
    test runs. The change that adds this report drops `--lib --tests` from
-   both documents and from `tools/audit.py`; the corrected command's
-   result is PENDING until the run in progress ends.
+   both documents and from `tools/audit.py`; the corrected command passes.
 2. **The Lean checks pass on the pinned toolchain.** `check.py` reproduced
    the traces and the official vectors and found every theorem on Lean's
    standard axioms; `emit.py` rebuilt the proofs' formula to the committed
@@ -127,6 +126,11 @@ by number.
    status on `servil-software-factory/BLAKE3` using a token file; it stops
    at once without that token. Whether the audited commit carries a
    passing "long proofs" status there was not checked.
+4. **`tools/check-waker-order.py` fails with a Python traceback where the
+   Rust standard library for `aarch64-apple-darwin` is not installed.**
+   `tools/check-builds.sh` installs it first, so the gate is unaffected;
+   run alone, the check reads as a failure of the code. `tools/audit.py`
+   reports it SKIPPED with the command that installs the target.
 
 ## Not run here, and why
 
@@ -140,6 +144,10 @@ by number.
 | `mutants` (whole crate) | needs cargo-mutants; about an hour on the project's hosts |
 | `tools/check-builds.sh`, `tools/dependency_policy.py` | landing gates with their own tools (cross targets, cargo-deny, cargo-vet); outside this audit's list |
 | doc tests, the `machine` nextest profile | not in `tools/audit.py`'s list; the second needs a machine to itself |
+
+The first run was of the audited commit; `b3sum_tests` and `waker_order`
+were run again on the commit that adds this report, which changes no
+shipped code.
 
 ## Limits of this audit
 

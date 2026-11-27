@@ -64,6 +64,7 @@ class Verdicts(unittest.TestCase):
         self.assertIn("needs a no-such-cpu CPU", audit.missing("arch:no-such-cpu"))
         self.assertIn("needs 1000000 GB", audit.missing("mem:1000000"))
         self.assertIsNone(audit.missing("mem:0"))
+        self.assertIn("rustup target add no-such-target", audit.missing("target:no-such-target"))
 
     def test_every_listed_check_has_a_unique_name_and_known_needs(self):
         names = [c["name"] for c in audit.CHECKS]

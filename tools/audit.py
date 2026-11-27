@@ -49,8 +49,9 @@ def prove(name, command, needs=(), minutes=240):
                  tier="long", minutes=minutes)
 
 
-# A need is "cmd:PROGRAM" (on PATH), "py:MODULE" (importable), "arch:MACHINE"
-# (this CPU), or "mem:GIGABYTES" (this machine's memory, at least).
+# A need is "cmd:PROGRAM" (on PATH), "py:MODULE" (importable), "target:TRIPLE"
+# (a Rust standard library installed for it), "arch:MACHINE" (this CPU), or
+# "mem:GIGABYTES" (this machine's memory, at least).
 ARM_AS = "cmd:aarch64-linux-gnu-as"
 CHECKS = [
     check("lean_spec", "Lean specification", "python3 c2sp/BLAKE3/check.py", ["cmd:lake"]),
@@ -68,7 +69,7 @@ CHECKS = [
           [NEXTEST, "cmd:cargo-capi", "cmd:pkg-config"]),
     check("shuttle", "Thread schedules", f"RUSTFLAGS='--cfg shuttle' cargo test --release {SHUTTLE}", cwd="threads"),
     check("pipeline_controls", "Thread schedules", "python3 tools/pipeline_model_controls.py", minutes=60),
-    check("waker_order", "Thread schedules", "python3 tools/check-waker-order.py"),
+    check("waker_order", "Thread schedules", "python3 tools/check-waker-order.py", ["target:aarch64-apple-darwin"]),
     check("b3sum_controls", "b3sum I/O", "python3 tools/b3sum_controls.py", [NEXTEST], minutes=60),
     prove("prove_hybrid", "prove_hybrid.py", [ARM_AS]),
     prove("prove_sme2", "prove_sme2.py chunks chunks_at messages parents xof chunks_x2 every parents_every xof_every "
@@ -102,6 +103,10 @@ def missing(need):
     if kind == "py":
         found = subprocess.run([sys.executable, "-c", f"import {what}"], capture_output=True).returncode == 0
         return None if found else f"no Python module `{what}`"
+    if kind == "target":
+        libdir = subprocess.run(["rustc", "--print", "target-libdir", "--target", what], capture_output=True, text=True)
+        found = libdir.returncode == 0 and os.path.isdir(libdir.stdout.strip())
+        return None if found else f"no Rust standard library for {what} (`rustup target add {what}`)"
     if kind == "arch":
         machine = platform.machine().replace("arm64", "aarch64")
         return None if machine == what else f"needs a {what} CPU (this is {machine})"
