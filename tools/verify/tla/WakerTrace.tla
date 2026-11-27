@@ -1,12 +1,13 @@
 ------------------------------ MODULE WakerTrace ------------------------------
 (* Trace validation of Waker.tla against threads/src/waker.rs: every
-   schedule Shuttle runs of tests/shuttle_waker.rs's first test (a caller
+   schedule Shuttle runs of tests/shuttle_waker.rs's two tests (a caller
    waiting for one item, the worker finishing it, and one other thread
-   notifying with nothing done) is logged, and check.py turns each log into
+   notifying with nothing done; a caller registering two Wakers and
+   clearing, one other thread notifying) is logged, and check.py turns each log into
    the Waker.tla actions it is (`Traces`). A behavior starts at any trace
    and takes its actions in turn; one the model does not allow leaves no
    step, a deadlock TLC reports with the trace. A trace taken whole ends
-   with the caller having seen the item and every notifier done (Ends). *)
+   with the caller's script done and every notifier done (Ends). *)
 EXTENDS Waker, Sequences
 
 CONSTANT Traces
@@ -42,5 +43,5 @@ TNext == \/ /\ i < Len(Traces[t]) /\ Do(Traces[t][i + 1]) /\ i' = i + 1 /\ UNCHA
 
 TSpec == TInit /\ [][TNext]_tvars
 
-Ends == i = Len(Traces[t]) => seen = Rounds /\ \A n \in N : npc[n] = "end"
+Ends == i = Len(Traces[t]) => step > Len(Script) /\ \A n \in N : npc[n] = "end"
 =============================================================================
