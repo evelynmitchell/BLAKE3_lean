@@ -849,6 +849,28 @@ the Pipeline and writing its reason beside it;
 | Startup self-test | a miscompiled, mislinked, or faulty-hardware kernel on the user's machine | its inputs run every kernel entry point but the ARM64 kernels for short messages of unequal lengths (a unit test checks it each run), and each case's output feeds the next, so one wrong result changes every later one | faults that appear only after startup |
 | Guard pages | out-of-bounds access in the paths tested, assembly included | a byte planted past a buffer crashes the guard-page tests | paths not exercised; data races |
 
+TLA+ models of `finish.rs`, `waker.rs` and `park.rs` (`tools/verify/tla/`,
+one atomic operation an action, named after the functions they model)
+are checked by TLC over every schedule of small instances: three
+finishers; three rounds of the waker slot; three workers with one wake
+a hop and three batches, and two workers that leave at the end as
+`tests/shuttle_park.rs`'s do. Beside the safety invariants (the caller
+returns only with every piece finished, one thread at a time in the
+waker's cell, a wake reaching a worker still looking is passed on)
+they check liveness under weak fairness, which Shuttle's sampled
+schedules cannot state: every waiter returns, every piece is taken,
+every worker leaves. `python3 tools/verify/tla/check.py` runs them
+(minutes) and plants seven faults, each of which TLC must reject: a
+finisher comparing the count before its piece, a caller parking on a
+count read apart from its bit, a caller returning on any wake, no
+re-check after registering a waker, a worker taking the waker while the
+caller writes it, a worker parking without looking again, and a wake not
+passed on. Dropping the owed word's generation bump (ABA) is not caught:
+the schedule needs a payer's two compare-and-swaps to straddle a
+publisher's add and equal payments by others, past these instances;
+Shuttle's `coincident_publishers_and_payers_keep_fresh_fanout` covers
+it. The models are not the code; Shuttle runs the code.
+
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs` and `pipeline.rs` against its concurrency primitives.
 `check-builds.sh` runs all four before each landing; `--cfg shuttle` is
