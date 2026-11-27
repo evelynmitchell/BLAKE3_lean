@@ -860,12 +860,26 @@ waker's cell, a wake reaching a worker still looking is passed on)
 they check liveness under weak fairness, which Shuttle's sampled
 schedules cannot state: every waiter returns, every piece is taken,
 every worker leaves. `python3 tools/verify/tla/check.py` runs them
-(minutes) and plants seven faults, each of which TLC must reject: a
+(minutes) and plants seven faults in these three, each of which TLC must reject: a
 finisher comparing the count before its piece, a caller parking on a
 count read apart from its bit, a caller returning on any wake, no
 re-check after registering a waker, a worker taking the waker while the
 caller writes it, a worker parking without looking again, and a wake not
-passed on. Dropping the owed word's generation bump (ABA) is not caught:
+passed on. Three more models state the `Pipeline` (`pipeline.rs`):
+`PipeRooms.tla` its rooms and their credits (a room handed out again
+only once every credit is back; a piece reads its own hand-out's bytes,
+and is published done only with its output written; a Room may be
+dropped on another thread while the owner waits), `PipeTasks.tla` a
+lent message hashed in parts and a short-message group (an event only
+once every part or member is hashed; a Lent guard dropped at its event
+finds its loan complete), and `PipeStorage.tla` a storage outliving
+its Pipeline (on the free list only once no Pipeline or Room holds it,
+and once; the next Pipeline never hands out a surviving Room's room),
+each with liveness: the owner makes every commit and takes every
+event, and the storage goes back on the free list.
+Each of `tools/pipeline_model_controls.py`'s ten faults is planted in
+them too (5 and 10 are one mechanism there), and TLC rejects each.
+Dropping the owed word's generation bump (ABA) is not caught:
 the schedule needs a payer's two compare-and-swaps to straddle a
 publisher's add and equal payments by others, past these instances;
 Shuttle's `coincident_publishers_and_payers_keep_fresh_fanout` covers
