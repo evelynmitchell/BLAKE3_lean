@@ -9,7 +9,7 @@ Commands:
     python3 tools/verify/prove_hybrid.py [KERNEL...]   # c/blake3_neon_hybrid_aarch64.S: c1, k2-k10, p2-p9, q1-q9, l2-l9, kn, pn, x1, x4, x8 (527 cases, about 6 minutes on 16 CPUs)
     python3 tools/verify/prove_sme2.py [KERNEL...]     # c/blake3_sme2_aarch64.S: chunks, chunks_at, messages, parents, xof, and the chunk and parent kernels at every group count (36 cases, minutes); c/blake3_sme2_hybrid_aarch64.S: chunks_x2 (2 cases, 2 min)
     python3 tools/verify/prove_sme2.py xof_every messages_every x2_every  # the other kernels at every group count (x2_every about 12 minutes)
-    python3 tools/verify/lean/emit.py                   # the definition, from the Lean specification (needs Lean)
+    python3 tools/verify/lean/emit.py                   # the definition, from the Lean specification, and the tree algorithms' proofs (Algorithms.lean) (needs Lean)
     (cd tools/verify/lean && lake build vectors && .lake/build/bin/vectors ../../../test_vectors/lean_vectors.json)  # the specification's own vectors, which the Rust tests read (needs Lean; seconds)
     python3 tools/verify/cross_check.py                 # the NEON and integer models against the CPU
     python3 tools/verify/cross_check_sme.py             # the streaming SVE and SME2 models against the CPU (needs SME2)

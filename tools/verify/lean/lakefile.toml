@@ -1,5 +1,5 @@
 name = "Blake3Servil"
-defaultTargets = ["Generic", "Bridge", "Term", "Sound"]
+defaultTargets = ["Generic", "Bridge", "Term", "Sound", "Algorithms"]
 
 [[require]]
 name = "Blake3"
@@ -16,6 +16,10 @@ name = "Term"
 
 [[lean_lib]]
 name = "Sound"
+
+# The tree algorithms the library uses, proved to compute the specification's tree.
+[[lean_lib]]
+name = "Algorithms"
 
 # test_vectors/lean_vectors.json (Vectors.lean): compiled, since the interpreter takes
 # minutes over the inputs.
