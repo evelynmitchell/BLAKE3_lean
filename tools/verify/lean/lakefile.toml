@@ -1,5 +1,5 @@
 name = "Blake3Servil"
-defaultTargets = ["Generic", "Bridge", "Term", "Sound", "Algorithms"]
+defaultTargets = ["Generic", "Bridge", "Term", "Sound", "Algorithms", "Credits"]
 
 [[require]]
 name = "Blake3"
@@ -20,6 +20,10 @@ name = "Sound"
 # The tree algorithms the library uses, proved to compute the specification's tree.
 [[lean_lib]]
 name = "Algorithms"
+
+# A Pipeline room's credit count at its real size (threads/src/pipeline.rs).
+[[lean_lib]]
+name = "Credits"
 
 # test_vectors/lean_vectors.json (Vectors.lean): compiled, since the interpreter takes
 # minutes over the inputs.

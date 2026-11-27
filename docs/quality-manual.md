@@ -959,6 +959,20 @@ these model tests are run with Shuttle's own scheduling.
   that skips a real parent or writes the right subtree first, a layer
   that passes its last value up where it merges, and a proof replaced
   by `sorry` each fail the build.
+- **Lean proof of a Pipeline room's credit count**
+  (`tools/verify/lean/Credits.lean`, built by `emit.py`): each step on a
+  room's count (`init_taken`, `take_credit` with its renewal at
+  `ROOM_CREDITS - 1`, `release_n` of any number, `Room::drop`) keeps it
+  the Room's unspent credits plus those out to pieces and short
+  messages, at `ROOM_CREDITS` = 2^30 on 64-bit words. So no step wraps
+  the word, the count stays below `ROOM_CLOSING_BIT`, a held Room always
+  has a credit left (a room reads free, 0, exactly when no Room or
+  credit holds it), a Room's drop wakes the owner exactly when it frees
+  the room, and a surviving Room's count after `Pipeline::drop` is its
+  unspent credits (its drop's assertion). One assumption: at most 2^32
+  credits out of a room at once (bounded by the piece nodes and slots).
+  Renewal at `ROOM_CREDITS` commits, a closing bit within the counts'
+  range, and a drop giving back one credit more each fail the build.
 - **Kani** (bounded model checking) and **Aeneas** (safe Rust
   translated to Lean): used for the pool's cuts and batch tables (Kani)
   and the tree walk and the Hasher (Aeneas, with machine-code proofs of

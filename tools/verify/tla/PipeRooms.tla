@@ -14,7 +14,13 @@
    holds, then waits for every piece's event. Waits use the WakerSlot's
    contract, which Waker.tla checks: register, re-check, and a notify after
    it wakes the waiter. `gen` counts each room's hand-outs: a piece reads
-   its room's bytes of the hand-out it was committed from. *)
+   its room's bytes of the hand-out it was committed from.
+
+   `Credits` is 3 here, against 2^30 in the code: the count's arithmetic
+   at its real size, on 64-bit words, is tools/verify/lean/Credits.lean's,
+   which proves each of these steps keeps the count the Room's unspent
+   credits plus those out, with no wrap and below the closing bit, for
+   every sequence of steps. What this model adds is the schedules. *)
 EXTENDS Naturals, Integers, FiniteSets
 
 CONSTANTS Rooms, Credits, Commits
