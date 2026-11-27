@@ -897,18 +897,22 @@ these model tests are run with Shuttle's own scheduling.
   incremental stack (every chunk pushed in turn, merging while the count
   is even), the stack's rows (a subtree held as its parts' values:
   condensing one gives its tree; two merged a layer at a time, then
-  condensed, give their parent; halving is a layer), cut and merge (full subtrees in place, hashed apart, pushed
+  condensed, give their parent; halving is a layer), `b3sum --outboard`
+  (its layers' values are the trees of their groups, its walk by index
+  is the tree's pre-order of parents, and the tree over 16 KiB groups is
+  the file's), cut and merge (full subtrees in place, hashed apart, pushed
   in order, then the rest), extended output (prefixes and seeking), and
   counters that do not wrap, each proved equal to `Blake3.lean`'s tree
   and output for every input, on Lean's standard axioms. They are
   proved over any merge function, so they are about the tree's shape.
-  They model the algorithms, not the Rust: `b3sum`'s outboard is not
-  yet modelled, and the tests
+  They model the algorithms, not the Rust, and the tests
   (`test_vectors/lean_vectors.json`) are what tie the Rust to the
   specification. A stack that merges one level too few, a root
   assembled in the wrong order, an output counter off by one, a layer
   of parents merging each pair the wrong way round, a condense that
-  skips a layer, rows merged at mismatched widths and a proof replaced
+  skips a layer, rows merged at mismatched widths, an outboard walk
+  that skips a real parent or writes the right subtree first, a layer
+  that passes its last value up where it merges, and a proof replaced
   by `sorry` each fail the build.
 - **Kani** (bounded model checking) and **Aeneas** (safe Rust
   translated to Lean): used for the pool's cuts and batch tables (Kani)
