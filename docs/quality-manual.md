@@ -1092,6 +1092,28 @@ thousands of schedules, not all; and the pool itself is the stand-in.
 gate does not cover: it takes eleven protections out one at a time and
 requires the test for each to fail.
 
+`b3sum`'s reads to a file's end are a TLA+ model too
+(`tools/verify/tla/FileEnd.tla`), checked by `tools/verify/tla/check.py`
+against every answer Linux may give each read: bytes up to the count
+asked, 0, `EINTR`, a refused probe (`EAGAIN`, `EOPNOTSUPP`, a sandbox's
+`EPERM`, `EIO`), the 0 that a read that may not wait gives early on
+Linux 5.9 and 5.10, a real failure (`EIO`) and a pipe's `ESPIPE`, while
+the file grows by appends. It states four ways a file is read: the
+warm path of `linux_pipe.rs` without a ring (`cached_then_plain`, then
+`finish_sync_hash`), `hash_open_file_ex`'s small files,
+`read_to_its_end`, and `direct.rs`'s pieces and the byte after them. Its
+invariants are that a hash is of as many bytes as a waiting read, asked
+at that offset, found the file to end at; that no hash follows a real
+failure; that no failure is reported without one (not for a refused
+probe, an `EINTR` or a pipe); that a buffer holds at most
+`SMALL_MEM_CAP` before the read streams; and that every read ends.
+Eight planted faults each fail it, two of them `b3sum_controls.py`'s
+(#424's sized read and direct read); the protections that are memory or
+descriptor handling, the checkfile and output, and the ring are outside
+it. Each answer the kernel gives is chosen afresh, so a kernel that
+repeats the early 0 at one offset forever is outside it as well. It is
+a model of the code, not checked against it (stage 5, #7).
+
 The current tests use bounded scenarios and probabilistic schedule
 selection (`check_pct`), not exhaustive enumeration of arbitrary callers.
 Shuttle does not model all hardware weak-memory behaviors. A passing run
