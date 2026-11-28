@@ -878,7 +878,7 @@ def queue_trace(line, tree=ROOT):
     claimed = "source.rs:%d" % next(k + 1 for k, l in enumerate(lines) if "claimed: OwnLine(AtomicUsize::new(0))," in l)
     out = [f'[a |-> "Mode", block |-> {"TRUE" if name == "block" else "FALSE"}]']
     act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
-    published, now_claimed, kind, waking = 0, 0, None, False
+    published, now_claimed, kind, waking, owed = 0, 0, None, False, False
     read = {}   # each taker's pending read: (its place in out, c, the model saw work there)
     # Takes are the worker's, outside its look again after its bit, and the
     # owner's in a wait before it sleeps (publish_actions' and
@@ -896,10 +896,19 @@ def queue_trace(line, tree=ROOT):
             if at2 >= at:
                 read[other] = (at2 + 1, c2, there2)
     for (thread, s, op, old, new) in events:
+        if owed and who(thread) == "owner" and not (s == "note" and op == "pubwake"):
+            # A wake the model owes after a publish, which the code's own
+            # read (later) found fewer waiting for: none was made.
+            if s == "note":
+                act("PubWake"); owed = False
         if s == "note":
             what, _, n = op.partition(" ")
             if what in ("tasks", "piece", "group"):
                 kind = (what, n)
+            elif what == "pubwake":
+                act("PubWake"); owed = False
+            elif what == "wakewait":
+                act("PubWake")
             elif what == "ran":
                 act("ORun") if who(thread) == "owner" else act("Run", w=1)
             elif what == "bit":
@@ -919,6 +928,7 @@ def queue_trace(line, tree=ROOT):
                 break   # the worker's stop is not the model's
         elif s == "published" and op == "store":
             published = int(new)
+            owed = published - now_claimed >= 2
             what, n = kind
             act("Tasks", n=n) if what == "tasks" else act("Piece") if what == "piece" else act("Group")
         elif waking and who(thread) == "owner" and s == claimed and op == "load":

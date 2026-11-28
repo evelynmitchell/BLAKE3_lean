@@ -36,6 +36,7 @@ Do(e) == CASE e.a = "Mode" -> blockOn = e.block /\ UNCHANGED vars
            [] e.a = "ORun" -> ORun
            [] e.a = "Sleep" -> Sleep
            [] e.a = "SleepCheck" -> SleepCheck
+           [] e.a = "PubWake" -> PubWake
            [] e.a = "Woken" -> Woken
            [] e.a = "Finish" -> Finish
 

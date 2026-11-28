@@ -213,10 +213,12 @@ mod lanes {
         /// The pool's wake after a publish: a parked worker where two or more wait.
         pub(crate) fn wake_after_publish(source: &Source) {
             if source.waiting() >= 2 {
+                crate::trace::note("pubwake");
                 crate::pool::wake();
             }
         }
         pub(crate) fn wake_one_for_waiting() {
+            crate::trace::note("wakewait");
             crate::pool::wake();
         }
     }
@@ -301,59 +303,60 @@ fn work(source: &'static Source) {
 /// runs waiting actions itself) or not.
 fn queue(block: bool) {
     blake3_servil_core::initialize();
-    shuttle::check_random(
-        move || {
-            trace::start(if block { "block" } else { "sleep" });
-            let source: &'static Source = Box::leak(Box::new(Source::with_actions(6)));
-            let worker = thread::spawn(move || work(source));
-            let mut next = 0u64;
-            for (what, n) in [("tasks", 2), ("piece", 1), ("group", 1)] {
-                trace::note(&format!("{what} {n}"));
-                let args: Vec<u64> = (next..next + n).collect();
-                next += n;
-                // Sound: `run` is safe to call once with any context.
-                unsafe { source.publish_actions(run, core::ptr::null(), &args, false) };
-            }
-            loop {
-                let seen = {
-                    // The count the wait began after, read under the note.
-                    let s = pool::STATE.lock().unwrap();
-                    if s.runs == 4 {
-                        break;
-                    }
-                    trace::note("wait");
-                    s.runs
-                };
-                if block {
-                    while source.run_waiting_action() {}
+    // Fixed seeds, as shuttle_pipeline.rs's: every run tries the same
+    // schedules, and a failure can be had again.
+    use shuttle::scheduler::RandomScheduler;
+    let seed = if block { 0x5005_ce01 } else { 0x5005_ce02 };
+    shuttle::Runner::new(RandomScheduler::new_from_seed(seed, 500), Default::default()).run(move || {
+        trace::start(if block { "block" } else { "sleep" });
+        let source: &'static Source = Box::leak(Box::new(Source::with_actions(6)));
+        let worker = thread::spawn(move || work(source));
+        let mut next = 0u64;
+        for (what, n) in [("tasks", 2), ("piece", 1), ("group", 1)] {
+            trace::note(&format!("{what} {n}"));
+            let args: Vec<u64> = (next..next + n).collect();
+            next += n;
+            // Sound: `run` is safe to call once with any context.
+            unsafe { source.publish_actions(run, core::ptr::null(), &args, false) };
+        }
+        loop {
+            let seen = {
+                // The count the wait began after, read under the note.
+                let s = pool::STATE.lock().unwrap();
+                if s.runs == 4 {
+                    break;
                 }
-                // wake_for_waiting, then the look again at the count, noted
-                // under the lock it is read under (PipeQueue.tla's Sleep and
-                // SleepCheck: a worker may park between them).
-                trace::note("sleep");
-                source.wake_for_waiting();
-                let mut s = pool::STATE.lock().unwrap();
-                trace::note("check");
-                if s.runs > seen {
-                    continue;
-                }
-                while s.runs == seen {
-                    s = pool::CHANGED.wait(s).unwrap();
-                }
-                trace::note("woken");
+                trace::note("wait");
+                s.runs
+            };
+            if block {
+                while source.run_waiting_action() {}
             }
-            assert!(pool::STATE.lock().unwrap().ran.iter().all(|&r| r), "every action ran");
-            trace::note("finish");
-            {
-                let mut s = pool::STATE.lock().unwrap();
-                s.stop = true;
-                pool::CHANGED.notify_all();
+            // wake_for_waiting, then the look again at the count, noted
+            // under the lock it is read under (PipeQueue.tla's Sleep and
+            // SleepCheck: a worker may park between them).
+            trace::note("sleep");
+            source.wake_for_waiting();
+            let mut s = pool::STATE.lock().unwrap();
+            trace::note("check");
+            if s.runs > seen {
+                continue;
             }
-            worker.join().unwrap();
-            trace::write();
-        },
-        500,
-    );
+            while s.runs == seen {
+                s = pool::CHANGED.wait(s).unwrap();
+            }
+            trace::note("woken");
+        }
+        assert!(pool::STATE.lock().unwrap().ran.iter().all(|&r| r), "every action ran");
+        trace::note("finish");
+        {
+            let mut s = pool::STATE.lock().unwrap();
+            s.stop = true;
+            pool::CHANGED.notify_all();
+        }
+        worker.join().unwrap();
+        trace::write();
+    });
 }
 
 #[test]
