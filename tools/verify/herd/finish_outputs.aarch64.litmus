@@ -1,0 +1,12 @@
+AArch64 finish_outputs.aarch64
+(* finish_outputs.litmus as rustc compiles it for aarch64-apple-darwin:
+   a plain output store STR, SeqCst fetch_add LDADDAL; SeqCst load LDAR,
+   a branch on it, the output load LDR. *)
+{ 0:X1=state; 0:X3=out; 1:X1=state; 1:X3=out; }
+ P0              | P1                  ;
+ LDAR X0,[X1]    | MOV X0,#1           ;
+ CMP X0,#1       | STR X0,[X3]         ;
+ B.NE LC00       | LDADDAL X0,X9,[X1]  ;
+ LDR X2,[X3]     |                     ;
+ LC00:           |                     ;
+exists (0:X0=1 /\ 0:X2=0)

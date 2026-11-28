@@ -1,0 +1,22 @@
+C sme2
+(* threads/src/lanes.rs sme2_serve against wake_sme2 (after source.rs's
+   publish): the SME2 thread stores SME2_PARKED (SeqCst), fences SeqCst,
+   and looks again for work (published, Acquire); the publisher stores
+   published (Release), fences SeqCst, and swaps SME2_PARKED to false
+   (SeqCst), unparking the thread if it was set. Forbidden: each misses
+   the other (the thread parks on work, the publisher wakes no one). *)
+{ [published]=0; [parked]=0; }
+
+P0 (atomic_int* published, atomic_int* parked) {
+  atomic_store_explicit(published, 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_exchange_explicit(parked, 0, memory_order_seq_cst);
+}
+
+P1 (atomic_int* published, atomic_int* parked) {
+  atomic_store_explicit(parked, 1, memory_order_seq_cst);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_load_explicit(published, memory_order_acquire);
+}
+
+exists (0:r0=0 /\ 1:r0=0)

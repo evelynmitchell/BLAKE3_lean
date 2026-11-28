@@ -1,0 +1,13 @@
+X86 park.x86
+(* park.litmus as rustc compiles it for x86-64: Release store and loads
+   MOV, fence(SeqCst) a locked OR on the thread's own stack (written here
+   as XCHG on a location of its own: under TSO every locked instruction
+   orders alike), SeqCst fetch_or LOCK OR (XCHG here). *)
+{ }
+ P0              | P1              ;
+ MOV [published],$1 | MOV EAX,$1   ;
+ MOV ECX,$0      | XCHG [parked],EAX ;
+ XCHG [s0],ECX   | MOV ECX,$0      ;
+ MOV EBX,[parked] | XCHG [s1],ECX  ;
+                 | MOV EBX,[published] ;
+exists (0:EBX=0 /\ 1:EBX=0)

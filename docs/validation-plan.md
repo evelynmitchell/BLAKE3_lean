@@ -17,7 +17,7 @@ As of November 27, 2026. Each stage's tracker issue holds its detail.
 | 1, the Lean definition as an oracle (#3) | done | `tools/verify/lean/Vectors.lean` writes `test_vectors/lean_vectors.json` (138 cases); every test that reads the official vectors reads it too: the `Hasher` (`test_vectors/`), the throughput and multithreaded calls (`threads/tests/vectors.rs`), the `Pipeline` (`pipeline_pool.rs`), the C API and `b3sum` |
 | 2, theorems about the algorithms (#4) | done | `tools/verify/lean/Algorithms.lean`: the incremental stack, cut and merge, rows, extended output, outboard and counters, each equal to the definition; `Pieces.lean` the `Pipeline`'s lazy fold of piece values (#21); `Credits.lean` a room's credit count at its real size (#19) |
 | 3, the thread protocols in TLA+ (#5) | done | `tools/verify/tla/`: the three handshakes, round-robin turns, and six models of the `Pipeline`, each with controls; the handshakes' models checked against Shuttle's schedules of the code (trace validation, #22). Left: trace validation of the `Pipeline` models and the waker's fast path (#31) |
-| 4, weak memory (#6) | open | |
+| 4, weak memory (#6) | done | `tools/verify/herd/`: the park, SME2, waker and finish handshakes and the finish line's outputs as litmus tests under RC11 (the language), the Arm model and x86-TSO (the instructions rustc emits), each outcome that loses a wake forbidden, and sixteen controls |
 | 5, `b3sum` in TLA+ (#7) | open | |
 | 6, the kernels' callers (#8) | waiting on its decision | |
 | 7, hax (#9) | open | |

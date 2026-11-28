@@ -1,0 +1,8 @@
+AArch64 finish.aarch64
+(* finish.litmus as rustc compiles it for aarch64-apple-darwin: SeqCst
+   fetch_or LDSETAL, SeqCst fetch_add LDADDAL, on one word. *)
+{ 0:X1=state; 1:X1=state; }
+ P0                  | P1                  ;
+ MOV X0,#2           | MOV X0,#1           ;
+ LDSETAL X0,X2,[X1]  | LDADDAL X0,X2,[X1]  ;
+exists (0:X2=0 /\ 1:X2=0)
