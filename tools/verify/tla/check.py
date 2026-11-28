@@ -121,7 +121,7 @@ CONTROLS = [
     ("PipeQueue", "a taker claims its action without comparing claimed (taken twice)", "PipeQueue.tla",
      "Won(t) == claimed + 1 = take[t].n", "Won(t) == take[t].n # 0"),
     ("PipeQueue", "a wait sleeps without wake_for_waiting", "PipeQueue.tla",
-     "/\\ IF Waiting > 0 THEN Wake ELSE UNCHANGED wpc        \\* wake_for_waiting", "/\\ UNCHANGED wpc"),
+     "/\\ opc' = IF Waiting > 0 THEN \"wakeup\" ELSE \"check\"", "/\\ opc' = \"check\""),
     ("MCPipeQueueFull", "the action ring is one short of what is handed out", "PipeQueue.tla",
      "ActionRing == Slots * MaxPieces + Nodes + Groups", "ActionRing == Slots * MaxPieces + Nodes + Groups - 1"),
     ("PipeQueue", "free_pieces is one short of the nodes", "PipeQueue.tla", "PieceRing == Nodes", "PieceRing == Nodes - 1"),
