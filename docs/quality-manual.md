@@ -30,7 +30,7 @@ release's measure of assurance.
 |---|---|---|
 | Wrong kernel output, out-of-bounds access, secret-dependent branch/address | proofs over assembled kernels under stated contracts; planted bad kernels rejected | correctness of all Rust callers, every toolchain's output, or the processor |
 | Worker reads state after its owner frees it | Pipeline worker-visible state lives for the process | correct reuse or synchronization of that state |
-| A wait loses a wake or races on a waker | Shuttle checks the production finish/park/waker modules; `tools/check-waker-order.py` compiles the Apple Arm64 wait handshakes (`WakerSlot`, `Park`, `sme2_serve`) and verifies their fences against `RCpc` loads, rejecting unfenced controls | every possible schedule, or weak-memory paths outside those handshakes |
+| A wait loses a wake or races on a waker | Shuttle checks the production finish/park/waker modules; `tools/check-waker-order.py` compiles the Apple Arm64 wait handshakes (`WakerSlot`, `Park`, `sme2_serve`) and verifies their fences against `RCpc` loads, rejecting unfenced controls; herd7 decides each handshake as a litmus test under RC11, the Arm model and x86-TSO (`tools/verify/herd/`) | every possible schedule, or weak-memory paths outside those handshakes |
 | The Pipeline hands a result, a Room or a storage over too early, or loses a wake | Shuttle runs the whole of `pipeline.rs` against a stand-in pool; ten planted faults each make that model fail | schedules not tried, weak-memory execution, and the pool itself, which the model replaces |
 | An `unsafe` block rests on a reason no one wrote down | every `unsafe` block across all five shipped crates and build scripts carries a `// Sound:` comment verified by `tools/unsafe_reasons.py` (0 undocumented blocks); `tools/counts.py` blocks rising counts of undocumented `unsafe`, `debug_assert!`, and narrowing-cast allows | that each stated reason is true: they are read by people and by the audits, not proved |
 | Kernel still writes an I/O buffer after error recovery frees it | failed `io_uring_enter` aborts before recovery or unwind; a ring dropped with reads in flight aborts; a panic in `b3sum` aborts | every other lifetime or cancellation path |
@@ -1023,6 +1023,41 @@ distinct); a model whose compare-and-swap never fails, and a
 `wake_for_waiting` that wakes a worker with nothing waiting, are each
 rejected. The rings `PipeQueue.tla` also states are the owner's alone
 and are not traced.
+
+Shuttle and the TLA+ models assume one total order of the operations
+(`SeqCst`). Whether the code's orderings give that order where the
+handshakes need it is checked by herd7 (herdtools7 7.57, its source
+pinned by commit, SHA-256 and BLAKE3; `tools/verify/herd/`): each wait
+handshake is a litmus test with its real orderings and fences, and its
+`exists` is the outcome that loses a wake, which must be forbidden. The
+handshakes are a worker parking (`park.rs`) and the SME2 thread parking
+(`lanes.rs`), each against a publish (`source.rs`), a caller registering
+its waker against a worker completing (`waker.rs`, `pipeline.rs`), and
+the finish line's (`finish.rs`); a fifth test checks that a caller that
+reads the count complete reads the finished pieces' outputs. Each is
+checked under RC11 (`rc11.cat`), the language's contract, and as the
+instructions rustc 1.97 emits for `aarch64-apple-darwin` (LSE atomics,
+`LDAPR` Acquire loads) under the Arm model and for x86-64 under x86-TSO.
+`python3 tools/verify/herd/check.py` runs the twelve tests (seconds,
+after herd7 is built once) and plants sixteen faults, each of which
+herd7 must allow: a fence left out on either side of each handshake,
+the waker's state load weakened to `Acquire`, the finish line's bit in a
+word of its own, and the finish line's count load `Relaxed`, the
+ordering of the bug Sam Shackleton found on October 24.
+
+Three results are worth knowing. The finish line's wait needs no
+ordering at all: two read-modify-writes on one word are ordered by
+coherence, as `finish.rs`'s header argues, and its `SeqCst` is there for
+the outputs. On Apple Arm64 the code is stronger than the language
+requires: with either of the park handshake's fences left out, or the
+waker's state load `Acquire` (`LDAPR`), the `AL` read-modify-writes and
+`LDAR` loads still forbid the lost wake, so no test on that hardware can
+see these faults, which RC11 shows. And on x86-64
+`fence(SeqCst)` compiles to a locked `OR` on the stack, not `MFENCE`,
+and the waker's fence is redundant beside its `SeqCst` store, an
+`XCHG`. The instructions were read from the compiler's output;
+`check-waker-order.py` checks the wait paths' fences on every run, but
+not the publisher's side or the finish line's.
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
 `waker.rs`, `pipeline.rs` and `source.rs` against its concurrency

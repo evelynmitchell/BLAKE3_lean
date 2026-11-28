@@ -1,0 +1,21 @@
+C waker
+(* threads/src/waker.rs register against notify_after_seqcst: the caller
+   stores REGISTERED (SeqCst), fences SeqCst, and re-checks completion
+   (pipeline.rs: slot_done, completed_epoch, a room's count, Acquire); the
+   worker publishes completion (a swap, SeqCst) and reads the slot's state
+   (SeqCst). Forbidden: each misses the other (the caller sleeps on done
+   work, the worker wakes no one). *)
+{ [done]=0; [state]=0; }
+
+P0 (atomic_int* done, atomic_int* state) {
+  int r9 = atomic_exchange_explicit(done, 1, memory_order_seq_cst);
+  int r0 = atomic_load_explicit(state, memory_order_seq_cst);
+}
+
+P1 (atomic_int* done, atomic_int* state) {
+  atomic_store_explicit(state, 2, memory_order_seq_cst);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_load_explicit(done, memory_order_acquire);
+}
+
+exists (0:r0=0 /\ 1:r0=0)

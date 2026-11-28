@@ -1,0 +1,11 @@
+AArch64 waker.aarch64
+(* waker.litmus as rustc compiles it for aarch64-apple-darwin: SeqCst
+   swap SWPAL, SeqCst load LDAR; SeqCst store STLR, fence(SeqCst)
+   DMB ISH, Acquire load LDAPR. *)
+{ 0:X1=done; 0:X3=state; 1:X1=done; 1:X3=state; }
+ P0                | P1             ;
+ MOV X0,#1         | MOV X0,#2      ;
+ SWPAL X0,X9,[X1]  | STLR X0,[X3]   ;
+ LDAR X2,[X3]      | DMB ISH        ;
+                   | LDAPR X2,[X1]  ;
+exists (0:X2=0 /\ 1:X2=0)

@@ -125,7 +125,12 @@ the plan have landed ([`validation-plan.md`](validation-plan.md#where-the-stages
   The handshakes' models are checked against Shuttle's schedules of the
   code; the `Pipeline`'s are not yet (#31).
 
-G3, G4, G6 and G7 stand as written.
+- **G6 is closed** for the wait handshakes: the park, SME2, waker and
+  finish handshakes, and the finish line's outputs, are litmus tests that
+  herd7 decides under RC11, the Arm model and x86-TSO, and each fails for
+  its planted faults (`herd_models`).
+
+G3, G4 and G7 stand as written.
 
 ## Findings from this run
 

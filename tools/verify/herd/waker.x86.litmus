@@ -1,0 +1,12 @@
+X86 waker.x86
+(* waker.litmus as rustc compiles it for x86-64: SeqCst swap XCHG, loads
+   MOV; SeqCst store XCHG, fence(SeqCst) a locked OR on the stack (XCHG on
+   a location of its own here). *)
+{ }
+ P0              | P1              ;
+ MOV EAX,$1      | MOV EAX,$2      ;
+ XCHG [done],EAX | XCHG [state],EAX ;
+ MOV EBX,[state] | MOV ECX,$0      ;
+                 | XCHG [s1],ECX   ;
+                 | MOV EBX,[done]  ;
+exists (0:EBX=0 /\ 1:EBX=0)

@@ -1,0 +1,22 @@
+C park
+(* threads/src/park.rs park_unless against source.rs publish_actions:
+   the worker sets its parked bit (fetch_or, SeqCst), fences SeqCst, and
+   looks again for work (published, Acquire); the publisher stores
+   published (Release), fences SeqCst, and reads the parked word
+   (wake_one, SeqCst). Forbidden: each misses the other (the worker parks
+   on work, the publisher wakes no one). *)
+{ [published]=0; [parked]=0; }
+
+P0 (atomic_int* published, atomic_int* parked) {
+  atomic_store_explicit(published, 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_load_explicit(parked, memory_order_seq_cst);
+}
+
+P1 (atomic_int* published, atomic_int* parked) {
+  int r9 = atomic_fetch_or_explicit(parked, 1, memory_order_seq_cst);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_load_explicit(published, memory_order_acquire);
+}
+
+exists (0:r0=0 /\ 1:r0=0)

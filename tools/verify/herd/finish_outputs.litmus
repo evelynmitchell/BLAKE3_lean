@@ -1,0 +1,20 @@
+C finish_outputs
+(* threads/src/finish.rs: a piece's output is written before finished()
+   counts it (fetch_add, SeqCst); the caller that reads the count
+   complete (finished_count, SeqCst) then reads the output. Forbidden:
+   the count complete and the output missing (Sam Shackleton's October 24
+   bug, with a Relaxed count load). *)
+{ [state]=0; [out]=0; }
+
+P0 (atomic_int* state, int* out) {
+  int r0 = atomic_load_explicit(state, memory_order_seq_cst);
+  int r1 = -1;
+  if (r0 == 1) { r1 = *out; }
+}
+
+P1 (atomic_int* state, int* out) {
+  *out = 1;
+  int r9 = atomic_fetch_add_explicit(state, 1, memory_order_seq_cst);
+}
+
+exists (0:r0=1 /\ 0:r1=0)
