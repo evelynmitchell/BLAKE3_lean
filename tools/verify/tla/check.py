@@ -1053,7 +1053,8 @@ def model_control(tla_jar, file, old, new, check, lines):
         text = open(path).read()
         if text.count(old) != 1:
             sys.exit(f"check.py: the control's text is not in {file} once: {old!r}")
-        open(path, "w").write(text.replace(old, new))
+        with open(path, "w") as f:
+            f.write(text.replace(old, new))
         return check(tla_jar, d, lines)
 
 
@@ -1069,7 +1070,8 @@ def code_control(tla_jar, source, old, new, recorder, check):
     text = open(path).read()
     if text.count(old) != 1:
         sys.exit(f"check.py: the control's text is not in {source} once: {old!r}")
-    open(path, "w").write(text.replace(old, new))
+    with open(path, "w") as f:
+        f.write(text.replace(old, new))
     return check(tla_jar, HERE, recorder(tree, os.path.join(build, "target")))
 
 
