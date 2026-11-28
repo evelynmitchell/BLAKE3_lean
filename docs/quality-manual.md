@@ -1010,19 +1010,29 @@ schedules, 6 distinct), the scenario's notes giving the owner's calls.
 The traces showed the model's `ready()` refused a call whose front was
 already done, which the code allows; a model with that refusal, and code
 whose group task completes its epoch twice, are each rejected.
-`PipeQueue` is not checked against the code (#31): its queue is
-`lanes.rs`'s `Source`, which `shuttle_pipeline.rs` replaces with a
-stand-in, and no Shuttle test runs the real one.
+`PipeQueue.tla`'s queue is checked against `Source` itself: `Source` is
+in its own file (`source.rs`, on its own `source_sync`), and
+`tests/shuttle_source.rs` compiles it and `finish.rs` beside Shuttle's
+primitives with a stand-in pool (one worker that takes, runs, and parks
+behind a bit a wake clears; an owner that publishes a slot's two tasks,
+a piece's action and a group's, then waits, running waiting actions
+itself or not). Each schedule's takes (the load of `claimed`, of
+`published`, the compare-and-swap), publications and the scenario's
+notes become `PipeQueue.tla`'s actions (1,000 schedules, about 800
+distinct); a model whose compare-and-swap never fails, and a
+`wake_for_waiting` that wakes a worker with nothing waiting, are each
+rejected. The rings `PipeQueue.tla` also states are the owner's alone
+and are not traced.
 
 Shuttle's models compile the production `finish.rs`, `park.rs`,
-`waker.rs` and `pipeline.rs` against its concurrency primitives.
-`check-builds.sh` runs all four before each landing; `--cfg shuttle` is
+`waker.rs`, `pipeline.rs` and `source.rs` against its concurrency
+primitives. `check-builds.sh` runs all five before each landing; `--cfg shuttle` is
 required to enable them. To reproduce:
 
 ```sh
 (cd threads && RUSTFLAGS="--cfg shuttle" cargo test --release \
   --test shuttle_finish --test shuttle_park --test shuttle_waker \
-  --test shuttle_pipeline)
+  --test shuttle_pipeline --test shuttle_source)
 python3 tools/pipeline_model_controls.py
 ```
 

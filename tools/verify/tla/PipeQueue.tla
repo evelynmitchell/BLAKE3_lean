@@ -87,13 +87,14 @@ Wake == IF Parked = {} THEN UNCHANGED wpc ELSE \E v \in Parked : wpc' = [wpc EXC
 (* publish_actions: n actions for `owner`, or its assert. *)
 Publish(n, owner) ==
     IF published - claimed + n > ActionRing
-    THEN fault' = "action ring" /\ UNCHANGED <<published, ring, what, wpc>>
+    THEN fault' = "action ring" /\ UNCHANGED <<published, ring, what, wpc, opc>>
     ELSE /\ ring' = [i \in 0..ActionRing - 1 |->
                        IF \E p \in published + 1..published + n : p % ActionRing = i
                        THEN CHOOSE p \in published + 1..published + n : p % ActionRing = i ELSE ring[i]]
          /\ what' = [a \in A |-> IF a > published /\ a <= published + n THEN owner ELSE what[a]]
          /\ published' = published + n
-         /\ IF published + n - claimed >= 2 THEN Wake ELSE UNCHANGED wpc
+         \* wake_after_publish: a wake owed where two or more wait (PubWake).
+         /\ opc' = (IF published + n - claimed >= 2 THEN "pubwake" ELSE "idle") /\ UNCHANGED wpc
          /\ UNCHANGED fault
 \* Ring.push_back, with its assert.
 PushRing(q, cap, x, name) == IF Len(q) < cap THEN q' = Append(q, x) /\ UNCHANGED fault ELSE fault' = name /\ UNCHANGED q
@@ -140,15 +141,16 @@ Worker(w) == Look(w) \/ Claim(w) \/ Run(w) \/ Recheck(w)
 Idle == opc = "idle" /\ fault = "none"
 Hand == Idle /\ made < Dispatches
 \* A slot's tasks.
-Tasks == /\ Hand /\ freeSlots # <<>>
-         /\ \E n \in 1..MaxPieces : Publish(n, <<"slot", Head(freeSlots), 0>>) /\ slotLeft' = [slotLeft EXCEPT ![Head(freeSlots)] = n]
-         /\ freeSlots' = Tail(freeSlots) /\ made' = made + 1
-         /\ UNCHANGED <<claimed, ran, take, running, freePieces, node, localRooms, room, group, blockOn, spinFor, opc, runs, slept>>
+TasksN(n) == /\ Hand /\ freeSlots # <<>>
+             /\ Publish(n, <<"slot", Head(freeSlots), 0>>) /\ slotLeft' = [slotLeft EXCEPT ![Head(freeSlots)] = n]
+             /\ freeSlots' = Tail(freeSlots) /\ made' = made + 1
+             /\ UNCHANGED <<claimed, ran, take, running, freePieces, node, localRooms, room, group, blockOn, spinFor, runs, slept>>
+Tasks == \E n \in 1..MaxPieces : TasksN(n)
 \* A room piece: a node, and for a whole Room a room off the local ring.
 Piece(r) == /\ Hand /\ freePieces # <<>>
             /\ Publish(1, <<"piece", Head(freePieces), r>>)
             /\ node' = [node EXCEPT ![Head(freePieces)] = "out"] /\ freePieces' = Tail(freePieces) /\ made' = made + 1
-            /\ UNCHANGED <<claimed, ran, take, running, freeSlots, slotLeft, group, blockOn, spinFor, opc, runs, slept>>
+            /\ UNCHANGED <<claimed, ran, take, running, freeSlots, slotLeft, group, blockOn, spinFor, runs, slept>>
 ShortPiece == Piece(0) /\ UNCHANGED <<localRooms, room>>
 WholePiece == /\ localRooms # <<>> /\ Piece(Head(localRooms))
               /\ room' = [room EXCEPT ![Head(localRooms)] = "busy"] /\ localRooms' = Tail(localRooms)
@@ -166,7 +168,7 @@ Group == /\ Hand /\ \E g \in 1..Groups : group[g] = "free"
          /\ LET g == CHOOSE g \in 1..Groups : group[g] = "free" IN
             Publish(1, <<"group", g, 0>>) /\ group' = [group EXCEPT ![g] = "out"]
          /\ made' = made + 1
-         /\ UNCHANGED <<claimed, ran, take, running, freeSlots, slotLeft, freePieces, node, localRooms, room, blockOn, spinFor, opc, runs, slept>>
+         /\ UNCHANGED <<claimed, ran, take, running, freeSlots, slotLeft, freePieces, node, localRooms, room, blockOn, spinFor, runs, slept>>
 \* Back on their rings: a slot whose tasks all ran, a node whose piece ran.
 InRing(q, x) == \E i \in 1..Len(q) : q[i] = x
 Reap(s) == /\ Idle /\ slotLeft[s] = 0 /\ ~InRing(freeSlots, s)
@@ -207,17 +209,26 @@ Busy == Outstanding \/ \E t \in Takers : running[t] # NONE
 StartWait == /\ Idle /\ Busy
              /\ opc' = "wait" /\ slept' = runs /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, fault>>
 \* Registered, it looks again: a run since, and it returns.
+\* wake_for_waiting; then, registered, the look again (its own step: a
+\* worker may park between).
 Sleep == /\ opc = "wait" /\ (~blockOn \/ claimed = published)
-         /\ IF Waiting > 0 THEN Wake ELSE UNCHANGED wpc        \* wake_for_waiting
-         /\ opc' = IF runs > slept THEN "idle" ELSE "sleep"
+         /\ opc' = IF Waiting > 0 THEN "wakeup" ELSE "check"   \* wake_for_waiting's read
+         /\ UNCHANGED wpc
          /\ UNCHANGED <<published, claimed, ring, what, ran, take, running, held, blockOn, spinFor, made, runs, slept, fault>>
+\* The wakes the owner owes: after a publish, and wake_for_waiting's.
+PubWake == /\ opc \in {"pubwake", "wakeup"} /\ Wake
+           /\ opc' = IF opc = "pubwake" THEN "idle" ELSE "check"
+           /\ UNCHANGED <<published, claimed, ring, what, ran, take, running, held, blockOn, spinFor, made, runs, slept, fault>>
+SleepCheck == /\ opc = "check"
+              /\ opc' = IF runs > slept THEN "idle" ELSE "sleep"
+              /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, slept, fault>>
 Woken == /\ opc = "sleep" /\ runs > slept
          /\ opc' = "idle" /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, slept, fault>>
 Finish == /\ Idle /\ made = Dispatches /\ ~Busy
           /\ opc' = "done" /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, slept, fault>>
 
 Owner == Tasks \/ ShortPiece \/ WholePiece \/ Scan \/ Group \/ (\E s \in 1..Slots : Reap(s)) \/ (\E n \in 1..Nodes : Drain(n))
-         \/ ORead \/ OClaim \/ ORun \/ Spin \/ SpinEnd \/ StartWait \/ Sleep \/ Woken \/ Finish
+         \/ ORead \/ OClaim \/ ORun \/ Spin \/ SpinEnd \/ StartWait \/ Sleep \/ PubWake \/ SleepCheck \/ Woken \/ Finish
 Next == Owner \/ \E w \in W : Worker(w)
 Spec == Init /\ [][Next]_vars /\ WF_vars(Owner) /\ \A w \in W : WF_vars(Worker(w))
 
