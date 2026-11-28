@@ -317,9 +317,16 @@ mod pipeline_sync {
     }
     pub(crate) use process_static;
 }
+/// The primitives src/source.rs runs on: the standard library's here, and
+/// Shuttle's in tests/shuttle_source.rs, which compiles that file beside its
+/// own `source_sync`.
+mod source_sync {
+    pub use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+}
 mod lanes;
 mod park;
 mod pipeline;
+mod source;
 mod waker;
 
 #[cfg(test)]
