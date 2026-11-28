@@ -306,20 +306,30 @@ fn queue(block: bool) {
                 unsafe { source.publish_actions(run, core::ptr::null(), &vec![0u64; n], false) };
             }
             loop {
-                let seen = pool::STATE.lock().unwrap().runs;
-                if seen == 4 {
-                    break;
-                }
-                trace::note("wait");
+                let seen = {
+                    // The count the wait began after, read under the note.
+                    let s = pool::STATE.lock().unwrap();
+                    if s.runs == 4 {
+                        break;
+                    }
+                    trace::note("wait");
+                    s.runs
+                };
                 if block {
                     while source.run_waiting_action() {}
                 }
-                trace::note("sleep");
+                // The model's sleep: wake_for_waiting, and its look at the
+                // count, noted where the count is read (under the lock).
+                let at_sleep = {
+                    let s = pool::STATE.lock().unwrap();
+                    trace::note("sleep");
+                    s.runs
+                };
                 source.wake_for_waiting();
-                let mut s = pool::STATE.lock().unwrap();
-                if s.runs > seen {
+                if at_sleep > seen {
                     continue;
                 }
+                let mut s = pool::STATE.lock().unwrap();
                 while s.runs == seen {
                     s = pool::CHANGED.wait(s).unwrap();
                 }
@@ -334,7 +344,7 @@ fn queue(block: bool) {
             worker.join().unwrap();
             trace::write();
         },
-        3000,
+        500,
     );
 }
 

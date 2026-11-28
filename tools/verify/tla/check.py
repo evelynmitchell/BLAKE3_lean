@@ -27,7 +27,8 @@ Room, and messages through slots in end order) log every schedule, operation by 
 log, turned into its model's actions, must be a behavior of the model
 (FinishTrace.tla, WakerTrace.tla, ParkTrace.tla, PipeRoomsTrace.tla,
 PipeTasksTrace.tla, PipeStorageTrace.tla, PipeShortTrace.tla,
-PipeSlotsTrace.tla).
+PipeSlotsTrace.tla), and shuttle_source.rs's Source against PipeQueue.tla
+(PipeQueueTrace.tla).
 
 A model that passes proves nothing until it is seen to fail: each control
 plants one fault (a re-check left out, a count read apart from its bit, a
@@ -879,11 +880,21 @@ def queue_trace(line, tree=ROOT):
     act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
     published, now_claimed, kind = 0, 0, None
     read = {}   # each taker's pending read: (its place in out, c, the model saw work there)
+    # Takes are the worker's, outside its look again after its bit, and the
+    # owner's in a wait before it sleeps (publish_actions' and
+    # wake_for_waiting's own reads are none).
+    taking = {"owner": False, "worker": True}
     def who(thread):
         return "owner" if thread == CALLER else "worker"
     def look(thread, at=None):
         a = '[a |-> "ORead"]' if who(thread) == "owner" else '[a |-> "Look", w |-> 1]'
-        out.insert(len(out) if at is None else at, a)
+        if at is None:
+            out.append(a)
+            return
+        out.insert(at, a)
+        for other, (at2, c2, there2) in list(read.items()):   # later places move up
+            if at2 >= at:
+                read[other] = (at2 + 1, c2, there2)
     for (thread, s, op, old, new) in events:
         if s == "note":
             what, _, n = op.partition(" ")
@@ -891,20 +902,25 @@ def queue_trace(line, tree=ROOT):
                 kind = (what, n)
             elif what == "ran":
                 act("ORun") if who(thread) == "owner" else act("Run", w=1)
+            elif what == "bit":
+                taking["worker"] = False
             elif what in ("again", "park", "woke"):
-                act("Settle", w=1)
+                act("Settle", w=1); taking["worker"] = True
             elif what == "wait":
-                act("StartWait")
+                act("StartWait"); taking["owner"] = name == "block"
             elif what == "sleep":
-                act("Sleep")
+                act("Sleep"); taking["owner"] = False
             elif what == "woken":
                 act("Woken")
             elif what == "finish":
                 act("Finish")
+                break   # the worker's stop is not the model's
         elif s == "published" and op == "store":
             published = int(new)
             what, n = kind
             act("Tasks", n=n) if what == "tasks" else act("Piece") if what == "piece" else act("Group")
+        elif not taking[who(thread)] and s in (claimed, "published") and op == "load":
+            continue
         elif s == claimed and op == "load":
             c = int(old)
             read[thread] = (len(out), c, c < published)
@@ -1018,7 +1034,7 @@ def code_control(tla_jar, source, old, new, recorder, check):
     return check(tla_jar, HERE, recorder(tree, os.path.join(build, "target")))
 
 
-def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
+def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline, source_lines):
     """The trace checks fail for a model narrowed past the code, and for
     code the model does not follow: (what, passed, what TLC said)."""
     return [
@@ -1079,6 +1095,12 @@ def trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
          *code_control(tla_jar, "threads/src/pipeline.rs", "            group.completed_epoch.swap(epoch, Ordering::SeqCst);\n",
                        "            group.completed_epoch.swap(epoch, Ordering::SeqCst);\n            group.completed_epoch.swap(epoch, Ordering::SeqCst);\n",
                        lambda tree, build: record_pipeline(tree, build)["slots"], check_slots_traces)),
+        ("PipeQueue.tla's compare-and-swap never fails (narrower than the code: two takers race)",
+         *model_control(tla_jar, "PipeQueue.tla", "Cas(t) == /\\ IF Won(t)", "Cas(t) == /\\ Won(t) /\\ IF Won(t)",
+                        check_queue_traces, source_lines)),
+        ("source.rs's wake_for_waiting wakes a worker with nothing waiting (the model does not)",
+         *code_control(tla_jar, "threads/src/source.rs", "        if self.waiting() > 0 {\n            wake_one_for_waiting();",
+                       "        if true {\n            wake_one_for_waiting();", record_source, check_queue_traces)),
         ("park.rs's wake_for asks for one wake more than it needs (the model does not)",
          *code_control(tla_jar, "threads/src/park.rs", "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked), self.fanout);",
                        "let (now, later) = split(wanted.saturating_sub(workers - parked).min(parked) + 1, self.fanout);", record_park, check_park_traces)),
@@ -1116,18 +1138,20 @@ def main(argv):
     build = os.path.join(os.path.abspath(os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")), "trace")
     finish_lines, waker_lines, park_lines = record_finish(ROOT, build), record_waker(ROOT, build), record_park(ROOT, build)
     pipeline = record_pipeline(ROOT, build)
+    source_lines = record_source(ROOT, build)
     for spec, check, lines in [("FinishTrace", check_finish_traces, finish_lines), ("WakerTrace", check_waker_traces, waker_lines),
                                ("ParkTrace", check_park_traces, park_lines), ("PipeRoomsTrace", check_rooms_traces, pipeline["room_wait"]),
                                ("PipeTasksTrace", check_tasks_traces, pipeline["lent_parts"]),
                                ("PipeStorageTrace", check_storage_traces, pipeline["storage"]),
                                ("PipeShortTrace", check_short_traces, pipeline["short"]),
-                               ("PipeSlotsTrace", check_slots_traces, pipeline["slots"])]:
+                               ("PipeSlotsTrace", check_slots_traces, pipeline["slots"]),
+                               ("PipeQueueTrace", check_queue_traces, source_lines)]:
         passed, said = check(tla_jar, HERE, lines)
         print(f"traces {spec}: {'PASS' if passed else 'FAIL'} {said if passed else said[:4000]}", flush=True)
         if not passed:
             failed.append(f"traces: {spec}")
     if "--models" not in argv:
-        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline):
+        for what, passed, said in trace_controls(tla_jar, finish_lines, waker_lines, park_lines, pipeline, source_lines):
             print(f"control traces: {what}: {'NOT CAUGHT' if passed else 'caught'} {said.splitlines()[0]}", flush=True)
             if passed:
                 failed.append(f"control: {what}")

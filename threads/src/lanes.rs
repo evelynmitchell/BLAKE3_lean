@@ -3083,7 +3083,6 @@ pub(crate) mod sources {
         pool().threads
     }
 
-
     /// One poll of a caller waiting for its pieces: a pause (yielding the
     /// CPU every YIELD_EVERY), and whether to poll on, which it does for
     /// SPIN_BEFORE_SLEEP from `started` before it sleeps.

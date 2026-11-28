@@ -40,7 +40,7 @@ NEXTEST = "cmd:cargo-nextest"
 # the Rust tests read (test_vectors/lean_vectors.json).
 LEAN_VECTORS = ("(cd tools/verify/lean && lake build vectors && .lake/build/bin/vectors ../../../test_vectors/lean_vectors.json)"
                 " && git diff --exit-code test_vectors/lean_vectors.json")
-SHUTTLE = "--test shuttle_finish --test shuttle_park --test shuttle_waker --test shuttle_pipeline"
+SHUTTLE = "--test shuttle_finish --test shuttle_park --test shuttle_waker --test shuttle_pipeline --test shuttle_source"
 
 
 def check(name, layer, command, needs=(), cwd=".", tier="quick", minutes=30):

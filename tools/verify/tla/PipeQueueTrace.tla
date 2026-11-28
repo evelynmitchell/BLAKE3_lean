@@ -14,7 +14,8 @@ CONSTANT Traces
 VARIABLES t, j
 tvars == <<vars, t, j>>
 
-TInit == Init /\ t \in 1..Len(Traces) /\ j = 0
+\* The executor is the trace's (its first step names it).
+TInit == Init /\ t \in 1..Len(Traces) /\ j = 0 /\ blockOn = Traces[t][1].block
 
 \* A worker's look again after its bit: Recheck, unless a wake has sent it
 \* looking already (the stand-in's wake clears the bit, as the model's).
