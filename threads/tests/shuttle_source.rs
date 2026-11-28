@@ -231,9 +231,11 @@ mod pool {
         pub bit: bool,
         pub stop: bool,
         pub runs: usize,
+        /// Which actions have run (by the number each was published with).
+        pub ran: [bool; 4],
     }
     shuttle::lazy_static! {
-        pub static ref STATE: Mutex<State> = Mutex::new(State { bit: false, stop: false, runs: 0 });
+        pub static ref STATE: Mutex<State> = Mutex::new(State { bit: false, stop: false, runs: 0, ran: [false; 4] });
         pub static ref CHANGED: Condvar = Condvar::new();
     }
     pub fn wake() {
@@ -248,10 +250,14 @@ mod pool {
 use shuttle::thread;
 use source::{Item, Source};
 
-/// An action: its run counted, the waiting owner told.
-unsafe fn run(_: *const (), _: u64, _: Platform) {
+/// An action, `arg` its number: run once (taken twice, it fails here), its
+/// run counted, the waiting owner told.
+unsafe fn run(_: *const (), arg: u64, _: Platform) {
     let mut s = pool::STATE.lock().unwrap();
     trace::note("ran");
+    let n = usize::try_from(arg).unwrap();
+    assert!(!s.ran[n], "action {n} ran twice");
+    s.ran[n] = true;
     s.runs += 1;
     pool::CHANGED.notify_all();
 }
@@ -300,10 +306,13 @@ fn queue(block: bool) {
             trace::start(if block { "block" } else { "sleep" });
             let source: &'static Source = Box::leak(Box::new(Source::with_actions(6)));
             let worker = thread::spawn(move || work(source));
+            let mut next = 0u64;
             for (what, n) in [("tasks", 2), ("piece", 1), ("group", 1)] {
                 trace::note(&format!("{what} {n}"));
+                let args: Vec<u64> = (next..next + n).collect();
+                next += n;
                 // Sound: `run` is safe to call once with any context.
-                unsafe { source.publish_actions(run, core::ptr::null(), &vec![0u64; n], false) };
+                unsafe { source.publish_actions(run, core::ptr::null(), &args, false) };
             }
             loop {
                 let seen = {
@@ -318,23 +327,22 @@ fn queue(block: bool) {
                 if block {
                     while source.run_waiting_action() {}
                 }
-                // The model's sleep: wake_for_waiting, and its look at the
-                // count, noted where the count is read (under the lock).
-                let at_sleep = {
-                    let s = pool::STATE.lock().unwrap();
-                    trace::note("sleep");
-                    s.runs
-                };
+                // wake_for_waiting, then the look again at the count, noted
+                // under the lock it is read under (PipeQueue.tla's Sleep and
+                // SleepCheck: a worker may park between them).
+                trace::note("sleep");
                 source.wake_for_waiting();
-                if at_sleep > seen {
+                let mut s = pool::STATE.lock().unwrap();
+                trace::note("check");
+                if s.runs > seen {
                     continue;
                 }
-                let mut s = pool::STATE.lock().unwrap();
                 while s.runs == seen {
                     s = pool::CHANGED.wait(s).unwrap();
                 }
                 trace::note("woken");
             }
+            assert!(pool::STATE.lock().unwrap().ran.iter().all(|&r| r), "every action ran");
             trace::note("finish");
             {
                 let mut s = pool::STATE.lock().unwrap();

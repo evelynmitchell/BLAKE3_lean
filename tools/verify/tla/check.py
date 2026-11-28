@@ -878,7 +878,7 @@ def queue_trace(line, tree=ROOT):
     claimed = "source.rs:%d" % next(k + 1 for k, l in enumerate(lines) if "claimed: OwnLine(AtomicUsize::new(0))," in l)
     out = [f'[a |-> "Mode", block |-> {"TRUE" if name == "block" else "FALSE"}]']
     act = lambda a, **f: out.append("[" + ", ".join([f'a |-> "{a}"'] + [f'{k} |-> {v}' for k, v in f.items()]) + "]")
-    published, now_claimed, kind = 0, 0, None
+    published, now_claimed, kind, waking = 0, 0, None, False
     read = {}   # each taker's pending read: (its place in out, c, the model saw work there)
     # Takes are the worker's, outside its look again after its bit, and the
     # owner's in a wait before it sleeps (publish_actions' and
@@ -909,7 +909,9 @@ def queue_trace(line, tree=ROOT):
             elif what == "wait":
                 act("StartWait"); taking["owner"] = name == "block"
             elif what == "sleep":
-                act("Sleep"); taking["owner"] = False
+                taking["owner"] = False; waking = True   # Sleep at wake_for_waiting's read of `claimed`
+            elif what == "check":
+                act("SleepCheck")
             elif what == "woken":
                 act("Woken")
             elif what == "finish":
@@ -919,6 +921,8 @@ def queue_trace(line, tree=ROOT):
             published = int(new)
             what, n = kind
             act("Tasks", n=n) if what == "tasks" else act("Piece") if what == "piece" else act("Group")
+        elif waking and who(thread) == "owner" and s == claimed and op == "load":
+            act("Sleep"); waking = False
         elif not taking[who(thread)] and s in (claimed, "published") and op == "load":
             continue
         elif s == claimed and op == "load":

@@ -208,17 +208,22 @@ Busy == Outstanding \/ \E t \in Takers : running[t] # NONE
 StartWait == /\ Idle /\ Busy
              /\ opc' = "wait" /\ slept' = runs /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, fault>>
 \* Registered, it looks again: a run since, and it returns.
+\* wake_for_waiting; then, registered, the look again (its own step: a
+\* worker may park between).
 Sleep == /\ opc = "wait" /\ (~blockOn \/ claimed = published)
          /\ IF Waiting > 0 THEN Wake ELSE UNCHANGED wpc        \* wake_for_waiting
-         /\ opc' = IF runs > slept THEN "idle" ELSE "sleep"
+         /\ opc' = "check"
          /\ UNCHANGED <<published, claimed, ring, what, ran, take, running, held, blockOn, spinFor, made, runs, slept, fault>>
+SleepCheck == /\ opc = "check"
+              /\ opc' = IF runs > slept THEN "idle" ELSE "sleep"
+              /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, slept, fault>>
 Woken == /\ opc = "sleep" /\ runs > slept
          /\ opc' = "idle" /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, slept, fault>>
 Finish == /\ Idle /\ made = Dispatches /\ ~Busy
           /\ opc' = "done" /\ UNCHANGED <<queue, held, blockOn, spinFor, made, runs, slept, fault>>
 
 Owner == Tasks \/ ShortPiece \/ WholePiece \/ Scan \/ Group \/ (\E s \in 1..Slots : Reap(s)) \/ (\E n \in 1..Nodes : Drain(n))
-         \/ ORead \/ OClaim \/ ORun \/ Spin \/ SpinEnd \/ StartWait \/ Sleep \/ Woken \/ Finish
+         \/ ORead \/ OClaim \/ ORun \/ Spin \/ SpinEnd \/ StartWait \/ Sleep \/ SleepCheck \/ Woken \/ Finish
 Next == Owner \/ \E w \in W : Worker(w)
 Spec == Init /\ [][Next]_vars /\ WF_vars(Owner) /\ \A w \in W : WF_vars(Worker(w))
 
