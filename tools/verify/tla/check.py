@@ -17,7 +17,11 @@ schedule of a small instance: the safety properties as invariants, and that
 no wake is lost as a liveness property under weak fairness, which Shuttle's
 sampled schedules cannot state. They model the code; they are not it. The
 names of the actions follow the functions they model, for a reader to
-compare.
+compare. FileEnd.tla states b3sum's reads to a file's end (file_end.rs and
+its callers in main.rs, linux_pipe.rs and direct.rs) against every answer the
+kernel may give each read, the file growing as it is read: only a waiting
+read's 0 ends a file, no real failure is swallowed and none invented, and a
+buffer is promoted to streaming at SMALL_MEM_CAP.
 
 Then the models are checked against the code (trace validation): the
 Shuttle tests of finish.rs, waker.rs (both), park.rs (owed_wakes_cascade)
@@ -58,7 +62,7 @@ JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 JAR_BLAKE3 = "36e4d95a99aa33dde9ff7b288bf3092f3dfbb26e450fc9758ee765cdb250ce38"
 
 # (model, its .cfg): each model module and its configuration.
-MODELS = ["Finish", "MCWaker", "MCWakerSwap", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "PipeShort", "Turn"]
+MODELS = ["Finish", "MCWaker", "MCWakerSwap", "MCPark", "MCParkLeave", "PipeRooms", "PipeTasks", "PipeStorage", "PipeSlots", "MCPipeSlotsOne", "PipeQueue", "MCPipeQueueFull", "PipeShort", "Turn", "FileEnd"]
 
 # (model, what the fault is, file, text to find once, its replacement, ...more
 # pairs of text and replacement for a fault that moves a step). The
@@ -140,6 +144,27 @@ CONTROLS = [
      "      start == IF inTurn THEN cursor[w] ELSE 1", "      start == 1"),
     ("Turn", "a turn's cursor stays on the slot it served", "Turn.tla",
      "cursor' = [cursor EXCEPT ![w] = (s % Sources) + 1]", "cursor' = [cursor EXCEPT ![w] = s]"),
+    ("FileEnd", "a read that may not wait ends the file with 0 (Linux 5.9 and 5.10 give 0 early)", "FileEnd.tla",
+     "IF flags = \"wait\" THEN Done(\"hash\", at)", "IF TRUE THEN Done(\"hash\", at)"),
+    ("FileEnd", "a probe the page cache refuses (EAGAIN, a sandbox's EPERM) fails the file", "FileEnd.tla",
+     "IF flags = \"nowait\" THEN /\\ pc' = \"rest\"", "IF FALSE THEN /\\ pc' = \"rest\""),
+    ("FileEnd", "a waiting read's failure is taken for a cache miss (EIO swallowed)", "FileEnd.tla",
+     "ELSE Done(\"err\", 0) /\\ UNCHANGED <<at, flags>>", "ELSE pc' = \"rest\" /\\ UNCHANGED <<at, flags, result>>"),
+    ("FileEnd", "a pipe's ESPIPE on the probe fails it (not NonSeekable)", "FileEnd.tla",
+     "[] r = ESPIPE -> /\\ pc' = (IF at = 0 THEN \"seqstream\" ELSE \"rest\")\n                                         /\\ UNCHANGED <<at, flags, result>>",
+     "[] r = ESPIPE -> Done(\"err\", 0) /\\ UNCHANGED <<at, flags>>"),
+    ("FileEnd", "an EINTR fails a positioned read (not retried)", "FileEnd.tla",
+     "/\\ CASE r = EINTR -> UNCHANGED <<pc, at, result>>\n                     [] r = ESPIPE -> IF at = 0",
+     "/\\ CASE r = EINTR -> Done(\"err\", 0) /\\ UNCHANGED at\n                     [] r = ESPIPE -> IF at = 0"),
+    ("FileEnd", "a buffer grows past SMALL_MEM_CAP (no promotion to streaming)", "FileEnd.tla",
+     "        /\\ IF at >= Cap\n           THEN /\\ pc' = \"posstream\"", "        /\\ IF FALSE\n           THEN /\\ pc' = \"posstream\"",
+     "Answers(at, Cap - at, FALSE, TRUE)", "Answers(at, MaxLen, FALSE, TRUE)"),
+    ("FileEnd", "b3sum_controls.py: a read for a known size goes on to where a read gives no byte (#424), removed", "FileEnd.tla",
+     "            THEN /\\ pc' = \"seqstream\"                 \\* read_to_end\n                 /\\ UNCHANGED <<at, intr, zeroAt, realErr, result>>",
+     "            THEN Done(\"hash\", hint) /\\ UNCHANGED <<at, intr, zeroAt, realErr>>"),
+    ("FileEnd", "b3sum_controls.py: a direct read reads once more for the file's end (#424), removed", "FileEnd.tla",
+     "                  THEN /\\ pc' = \"more\"\n                       /\\ UNCHANGED <<at, intr, zeroAt, realErr, result>>",
+     "                  THEN Done(\"hash\", hint) /\\ UNCHANGED <<at, intr, zeroAt, realErr>>"),
 ]
 
 
@@ -1028,7 +1053,8 @@ def model_control(tla_jar, file, old, new, check, lines):
         text = open(path).read()
         if text.count(old) != 1:
             sys.exit(f"check.py: the control's text is not in {file} once: {old!r}")
-        open(path, "w").write(text.replace(old, new))
+        with open(path, "w") as f:
+            f.write(text.replace(old, new))
         return check(tla_jar, d, lines)
 
 
@@ -1044,7 +1070,8 @@ def code_control(tla_jar, source, old, new, recorder, check):
     text = open(path).read()
     if text.count(old) != 1:
         sys.exit(f"check.py: the control's text is not in {source} once: {old!r}")
-    open(path, "w").write(text.replace(old, new))
+    with open(path, "w") as f:
+        f.write(text.replace(old, new))
     return check(tla_jar, HERE, recorder(tree, os.path.join(build, "target")))
 
 
@@ -1143,7 +1170,8 @@ def main(argv):
                     if text.count(old) != 1:
                         sys.exit(f"check.py: the control's text is not in {name} once: {what}: {old!r}")
                     text = text.replace(old, new)
-                open(path, "w").write(text)
+                with open(path, "w") as f:
+                    f.write(text)
                 passed, out = tlc(tla_jar, d, model)
             found = next((line for line in out.splitlines() if "violated" in line or "Deadlock" in line), "")
             print(f"control {model}: {what}: {'NOT CAUGHT' if passed else 'caught'} {found.strip()}", flush=True)

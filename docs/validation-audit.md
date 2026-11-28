@@ -130,7 +130,11 @@ the plan have landed ([`validation-plan.md`](validation-plan.md#where-the-stages
   herd7 decides under RC11, the Arm model and x86-TSO, and each fails for
   its planted faults (`herd_models`).
 
-G3, G4 and G7 stand as written.
+- **G7 is narrowed**: `b3sum`'s reads to a file's end are a TLA+ model
+  checked against every answer the kernel may give, with planted faults
+  (`FileEnd.tla`, in `tla_models`); the `io_uring` rules are not yet.
+
+G3 and G4 stand as written.
 
 ## Findings from this run
 
